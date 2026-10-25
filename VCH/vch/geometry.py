@@ -75,29 +75,32 @@ def prepare_mesh(cfg, mat, T_ref):
 
 
 def injection_weights(R_coil, d_out, N, dr):
-    band_lo = R_coil - d_out / 2.0
-    band_hi = R_coil + d_out / 2.0
-    w_in = np.zeros(N); w_out = np.zeros(N)
+    band_lo = R_coil - d_out/2.0
+    band_hi = R_coil + d_out/2.0
+    w_in  = np.zeros(N); w_out = np.zeros(N)
     for i in range(N):
-        r_in = i * dr; r_out = (i + 1) * dr
+        r_in = i*dr; r_out = (i+1)*dr
         lo = max(r_in, band_lo); hi = min(r_out, band_hi)
-        if hi <= lo:
-            continue
+        if hi <= lo: continue
         overlap = hi - lo
-        if r_out <= R_coil:
-            w_in[i] += overlap
-        elif r_in >= R_coil:
-            w_out[i] += overlap
+        if r_out <= R_coil: w_in[i] += overlap
+        elif r_in >= R_coil: w_out[i] += overlap
         else:
-            f_in = (R_coil - r_in) / (r_out - r_in)
-            w_in[i] += overlap * f_in
+            f_in = (R_coil - r_in)/(r_out - r_in)
+            w_in[i]  += overlap * f_in
             w_out[i] += overlap * (1.0 - f_in)
+            
     si = w_in.sum(); so = w_out.sum()
-    if si > 0:
-        w_in /= si
-    if so > 0:
-        w_out /= so
-    return 0.5 * w_in + 0.5 * w_out
+    if si > 0: w_in  /= si
+    if so > 0: w_out /= so
+    
+    # Calculate exact split based on tube surface areas
+    area_in = R_coil - d_out / 2.0
+    area_out = R_coil + d_out / 2.0
+    frac_out = area_out / (area_in + area_out)
+    frac_in = 1.0 - frac_out
+    
+    return frac_in * w_in + frac_out * w_out
 
 
 def steel_mass(cfg, T_ref):
