@@ -1,0 +1,11 @@
+project_root/
+├── main.py                 # The Orchestrator (Runs the workflow)
+├── engine_1d.py            # The fast 1D Batch Engine (Phases A, B, C)
+├── engine_2d.py            # The heavy 2D Draining Engine (Phase D, E)
+└── out/
+    └── run_YYYYMMDD_HHMMSS/
+        ├── 1D_Sweep_Results.csv
+        ├── 1D_Graphs.png
+        ├── 2D_Heatmap.png
+        ├── Drain_Curve.png
+        └── Final_Report.html

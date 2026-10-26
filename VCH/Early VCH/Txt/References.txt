@@ -1,0 +1,33 @@
+Data Provenance & Reference Source (Metals)
+
+The values provided below are not made up. They are derived from standard material property reference databases:
+
+    NIST (National Institute of Standards and Technology) Materials Data / Cryogenic Material Properties Database for sub-zero temperature thermal property estimations.
+
+    ASME Boiler and Pressure Vessel Code (Section II, Part D) and ASM Handbook, Vol. 1 & 2 for thermal properties of Stainless Steel (AISI 304 grade standard) and Mild Steel (Low-carbon steel, ~0.2% C) from room temperature up to 200°C.
+
+Reference Sources & Standards (Insulation)
+
+    ASTM International Standards: Specific consensus testing methods (such as ASTM C177 / ASTM C518 guarded hot plate method) and material specifications linked in the table.
+
+    ASHRAE Handbook of Fundamentals: Contains tabulated thermophysical properties for thermal insulation materials under steady-state condition.
+
+    Perry's Chemical Engineers' Handbook (Section 11: Heat Transfer Equipment): Standard reference for process tank insulation properties.
+
+References & Sources
+
+    Chilton, T. H., Drew, T. B., & Jebens, R. H. (1944). "Heat Transfer Coefficients in Agitated Vessels." Industrial & Engineering Chemistry, 36(6), 510–516. (Source for flat-blade turbine and marine propeller turbulent correlations).
+
+    Brooks, P. C., & Su, G. J. (1959). "Heat Transfer in Agitated Vessels." Chemical Engineering Progress, 55(10), 54–58. (Source for transitional/laminar flat-blade turbine coefficients).
+
+    Strek, F. (1963). "Heat Transfer in Agitated Vessels." International Chemical Engineering, 3, 533–541. (Source for pitched-blade turbine correlations).
+
+    Uhl, V. W., & Voznick, H. P. (1960). "The Anchor Agitator: Performance and Design." Chemical Engineering Progress, 56(3), 72–77. (Source for anchor agitator wall-shear heat transfer constants).
+
+    Uhl, V. W., & Gray, J. B. (1966). Mixing: Theory and Practice (Vol. 1 & 2). Academic Press. (Comprehensive compilation of jacketed and coiled agitated vessel heat transfer coefficients).
+
+    Bourne, J.R., et al. (1981). Heat Transfer in Viscous Media with Helical Ribbon Agitators. Chemical Engineering Science. (Source for deep laminar helical ribbon parameters).
+
+    Perry, R. H., & Green, D. W. Perry's Chemical Engineers' Handbook (Section 11: Heat Transfer Equipment and Section 18: Liquid-Liquid Mixing). McGraw-Hill.
+
+Reference Sources & Literature DataDifferential Scanning Calorimetry (DSC) Studies on Palm Oil Melting Profiles:Tan, C. P., & Che Man, Y. B. (2002). "Differential scanning calorimetric analysis of edible oils: Comparison of thermal properties and thermal profiles of palm oil, palm olein, and palm stearin." Food Chemistry, 78(3), 321–327.Demonstrates the asymmetric DSC thermal absorption peak of RBD palm oil with major melting endotherms between $20^\circ\text{C}$ and $38^\circ\text{C}$ peaking near $30^\circ\text{C}$.Liquid Density and Viscosity Correlations:Timms, R. E. (1985). "Physical properties of oils and mixtures of oils." Journal of the American Oil Chemists' Society, 62(2), 241–249.Establishes density regression ($\rho \approx 925 - 0.69 \cdot T$) and temperature-dependent dynamic viscosity curves for liquid palm oil.Thermal Conductivity & Specific Heat Coefficients:Perry, R. H., & Green, D. W. Perry's Chemical Engineers' Handbook (Section 2: Physical and Chemical Data - Properties of Organic Liquids).Morad, N. A., et al. (2000). "Thermal Conductivity and Specific Heat Capacity of Palm Oil Products." Journal of Oil Palm Research, 12(2), 52–61.* (Palm Oil)
