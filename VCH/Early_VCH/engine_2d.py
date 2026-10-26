@@ -1,5 +1,5 @@
 # ============================================================
-# engine_2d.py — 2D Draining Physics Engine (Suction & Partial Fill)
+# engine_2d.py — 2D Draining Physics Engine (Safe Division Patch)
 # ============================================================
 import numpy as np
 from numba import njit, objmode
@@ -16,9 +16,9 @@ import sys
 @njit(cache=True)
 def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
     A = np.pi * (d_in/2.0)**2
-    v = m_dot / (rho * A)
-    Re = rho * v * d_in / mu
-    Pr = mu * cp / k
+    v = m_dot / (max(1e-6, rho) * A)
+    Re = rho * v * d_in / max(1e-6, mu)
+    Pr = mu * cp / max(1e-6, k)
     if Re > 10000.0:
         f = (0.79*np.log(Re) - 1.64)**-2
         Nu = (f/8.0)*(Re - 1000.0)*Pr/(1.0 + 2.17*np.sqrt(f/8.0)*(Pr**(2.0/3.0) - 1.0))
@@ -39,8 +39,8 @@ def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
     
     if has_agitator == 1:
         N_rps = N_rpm / 60.0
-        Re_ia = rho * N_rps * (D_imp**2) / mu
-        Pr = mu * cp / k
+        Re_ia = rho * N_rps * (D_imp**2) / max(1e-6, mu)
+        Pr = mu * cp / max(1e-6, k)
         if ag_type == 1: C, a = 0.60, 0.67
         elif ag_type == 2: C, a = 0.54, 0.67
         elif ag_type == 3: C, a = 0.40, 0.50
@@ -48,10 +48,10 @@ def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
         Nu = C * (Re_ia ** a) * (Pr ** (1.0/3.0)) * visc_corr
         return Nu * k / d_out
     else:
-        nu = mu / rho; alpha = k / (rho * cp); Pr = nu / alpha
+        nu = mu / max(1e-6, rho); alpha = k / max(1e-6, rho * cp); Pr = nu / max(1e-6, alpha)
         d_char = d_out
-        Ra = 9.81 * beta * dT_natural * (d_char**3) / (nu * alpha)
-        Nu = (0.60 + (0.387 * Ra**(1.0/6.0)) / (1.0 + (0.559/Pr)**(9.0/16.0))**(8.0/27.0))**2
+        Ra = 9.81 * beta * dT_natural * (d_char**3) / max(1e-6, nu * alpha)
+        Nu = (0.60 + (0.387 * Ra**(1.0/6.0)) / (1.0 + (0.559/max(1e-6, Pr))**(9.0/16.0))**(8.0/27.0))**2
         return Nu * k / d_char
 
 @njit(cache=True)
@@ -117,7 +117,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         for j in range(N_z):
             V_cell[i, j] = np.pi * (r_out**2 - r_in**2) * dz
             
-    cycle_len = n_steps_heat + n_steps_cool
+    cycle_len = max(1, n_steps_heat + n_steps_cool) # SAFEGUARD
 
     stranded_prev = 0.0
     for i in range(N_r):
@@ -133,7 +133,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
     for step in range(n_steps):
         if step % 1000 == 0 or step == n_steps - 1:
             with objmode():
-                pct = (step / n_steps) * 100.0
+                pct = (step / max(1, n_steps)) * 100.0
                 sys.stdout.write("\r  2D Simulating... %.1f%% " % pct)
                 sys.stdout.flush()
 
@@ -152,7 +152,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 else:
                     T[i, j] = T_amb 
         
-        # Calculate Surface Level (Needed for draining & leveling)
         surf = np.zeros(N_r, dtype=np.int64)
         for i in range(N_r):
             surf[i] = 0
@@ -163,7 +162,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     
         avg_surf = np.mean(surf)
 
-        # 2. Coil Heating
         if is_heating:
             T_coil_avg = 0.0; n_coil_cells = 0
             for i in range(coil_i_start, coil_i_end + 1):
@@ -179,13 +177,12 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                                  T_tube_arr, k_tube_arr, T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
                                  has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural)
                 
-                q_per_cell = q_total / n_coil_cells
+                q_per_cell = q_total / max(1, n_coil_cells)
                 for i in range(coil_i_start, coil_i_end + 1):
                     for j in range(coil_j_start, coil_j_end + 1):
                         if mass[i, j] > 1e-6:
                             enthalpy[i, j] += q_per_cell * dt
 
-        # 3. 2D Conduction
         for i in range(N_r):
             for j in range(N_z):
                 if mass[i, j] <= 1e-6: continue
@@ -219,21 +216,19 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         drained_this_step = 0.0
         
         if is_heating:
-            # Suction radius depends on average fluid height (approx)
-            suction_r = int(avg_surf * (dz / dr))
+            suction_r = int(avg_surf * (dz / max(1e-6, dr)))
             
             best_i = -1
             best_j = -1
             
-            # Search inward and upward for the nearest liquid
             for i in range(drain_r, max(-1, drain_r - suction_r - 1), -1):
                 for j in range(drain_z, N_z):
                     if mass[i, j] > 1e-6 and T[i, j] > T_me:
                         best_i = i
                         best_j = j
-                        break # Found the lowest liquid in this column
+                        break
                 if best_i != -1:
-                    break # Found the closest liquid column to the drain
+                    break
             
             if best_i != -1:
                 h_head = (surf[best_i] - best_j) * dz
@@ -246,7 +241,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     
                 actual_drain = min(mass_rate_kg_s * dt, mass[best_i, best_j])
                 if actual_drain > 0.0:
-                    fraction = actual_drain / mass[best_i, best_j]
+                    fraction = actual_drain / max(1e-6, mass[best_i, best_j])
                     enthalpy[best_i, best_j] *= (1.0 - fraction)
                     mass[best_i, best_j] -= actual_drain
                     drained_mass_cum += actual_drain
@@ -279,7 +274,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         available = mass[i, j+1]
                         moved = min(needed, available)
                         if moved > 1e-9:
-                            h_spec = enthalpy[i, j+1] / mass[i, j+1]
+                            h_spec = enthalpy[i, j+1] / max(1e-6, mass[i, j+1])
                             mass[i, j] += moved; mass[i, j+1] -= moved
                             enthalpy[i, j] += moved * h_spec
                             enthalpy[i, j+1] -= moved * h_spec
@@ -291,7 +286,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     j_top = surf[i]; j_target = surf[i+1] + 1
                     if T[i, j_top] > T_me:
                         moved = mass[i, j_top] * 0.5
-                        h_spec = enthalpy[i, j_top] / mass[i, j_top]
+                        h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
                         mass[i, j_top] -= moved; mass[i+1, j_target] += moved
                         enthalpy[i+1, j_target] += moved * h_spec
                         enthalpy[i, j_top] -= moved * h_spec
@@ -299,7 +294,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     j_top = surf[i+1]; j_target = surf[i] + 1
                     if T[i+1, j_top] > T_me:
                         moved = mass[i+1, j_top] * 0.5
-                        h_spec = enthalpy[i+1, j_top] / mass[i+1, j_top]
+                        h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
                         mass[i+1, j_top] -= moved; mass[i, j_target] += moved
                         enthalpy[i, j_target] += moved * h_spec
                         enthalpy[i+1, j_top] -= moved * h_spec
@@ -309,7 +304,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     j_top = surf[i]; j_target = surf[i+1] + 1
                     if T[i, j_top] > T_me:
                         moved = mass[i, j_top] * 0.5
-                        h_spec = enthalpy[i, j_top] / mass[i, j_top]
+                        h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
                         mass[i, j_top] -= moved; mass[i+1, j_target] += moved
                         enthalpy[i+1, j_target] += moved * h_spec
                         enthalpy[i, j_top] -= moved * h_spec
@@ -317,7 +312,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     j_top = surf[i+1]; j_target = surf[i] + 1
                     if T[i+1, j_top] > T_me:
                         moved = mass[i+1, j_top] * 0.5
-                        h_spec = enthalpy[i+1, j_top] / mass[i+1, j_top]
+                        h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
                         mass[i+1, j_top] -= moved; mass[i, j_target] += moved
                         enthalpy[i, j_target] += moved * h_spec
                         enthalpy[i+1, j_top] -= moved * h_spec
@@ -371,9 +366,9 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             cyc_sol_kg[cycle_idx] = m_sol
             cyc_slu_kg[cycle_idx] = m_slu
             cyc_liq_kg[cycle_idx] = m_liq
-            cyc_sol_T[cycle_idx] = T_sol_sum / m_sol if m_sol > 1e-6 else 0.0
-            cyc_slu_T[cycle_idx] = T_slu_sum / m_slu if m_slu > 1e-6 else 0.0
-            cyc_liq_T[cycle_idx] = T_liq_sum / m_liq if m_liq > 1e-6 else 0.0
+            cyc_sol_T[cycle_idx] = T_sol_sum / max(1e-6, m_sol)
+            cyc_slu_T[cycle_idx] = T_slu_sum / max(1e-6, m_slu)
+            cyc_liq_T[cycle_idx] = T_liq_sum / max(1e-6, m_liq)
 
     with objmode():
         sys.stdout.write("\r  2D Simulating... 100.0%  \n")
@@ -393,20 +388,19 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     N_r = 10 * res
     N_z = 10 * res
     
-    tank_height = cfg["tank_height"] 
-    dr = cfg["r_inner"] / N_r
-    dz = tank_height / N_z
+    tank_height = max(1e-6, cfg["tank_height"]) 
+    dr = max(1e-6, cfg["r_inner"] / N_r)
+    dz = max(1e-6, tank_height / N_z)
     
     mass = np.zeros((N_r, N_z))
     enthalpy = np.zeros((N_r, N_z))
     
-    # --- PARTIAL FILL INITIALIZATION ---
-    rho_amb = np.interp(cfg["T_amb_mid"], mat["T_grid"], mat["rho_grid"])
+    rho_amb = max(1e-6, np.interp(cfg["T_amb_mid"], mat["T_grid"], mat["rho_grid"]))
     h_spec_amb = np.interp(cfg["T_amb_mid"], mat["T_grid"], mat["H_grid"])
     
     V_total_tank = np.pi * cfg["r_inner"]**2 * tank_height
     V_target = cfg["M_fluid"] / rho_amb
-    fill_fraction = V_target / V_total_tank
+    fill_fraction = V_target / max(1e-6, V_total_tank)
     
     if fill_fraction > 1.0: fill_fraction = 1.0
     
@@ -431,7 +425,7 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
 
     drain_r_idx, drain_z_idx = drain_location
     
-    T_drain_init = np.interp(enthalpy[drain_r_idx, drain_z_idx] / mass[drain_r_idx, drain_z_idx], mat["H_grid"], mat["T_grid"]) if mass[drain_r_idx, drain_z_idx] > 0 else cfg["T_amb_mid"]
+    T_drain_init = np.interp(enthalpy[drain_r_idx, drain_z_idx] / max(1e-6, mass[drain_r_idx, drain_z_idx]), mat["H_grid"], mat["T_grid"]) if mass[drain_r_idx, drain_z_idx] > 0 else cfg["T_amb_mid"]
     if T_drain_init < cfg["T_me"]:
         print(f"  WARNING: The drain cell is currently SOLID ({T_drain_init:.1f} °C). It will idle until heat reaches it.")
     
@@ -444,16 +438,15 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     
     A_coil_total = 2.0 * np.pi * R_coil * n_turns * cfg["d_out"]
     
-    # Calculate U_tank_air
     k_wall = float(np.interp(cfg["T_water_in"], cfg["T_wall_arr"], cfg["k_wall_arr"]))
-    R_wall_half = (cfg["t_wall"]/2.0) / k_wall
-    R_ins = (cfg["t_ins"]/cfg["k_ins"]) if cfg["t_ins"] > 0 else 0.0
-    R_conv = 1.0 / cfg["h_air"]
-    U_tank_air = 1.0 / (R_wall_half + R_ins + R_conv)
+    R_wall_half = (cfg["t_wall"]/2.0) / max(1e-6, k_wall)
+    R_ins = (cfg["t_ins"]/max(1e-6, cfg["k_ins"])) if cfg["t_ins"] > 0 else 0.0
+    R_conv = 1.0 / max(1e-6, cfg["h_air"])
+    U_tank_air = 1.0 / max(1e-6, R_wall_half + R_ins + R_conv)
     
-    n_cycles = cfg["N_cycles"]
-    n_steps_heat = int(cfg["t_window_hr"] * 3600.0 / cfg["dt_sec"])
-    n_steps_cool = int(cfg["t_cooldown_hr"] * 3600.0 / cfg["dt_sec"])
+    n_cycles = max(1, cfg["N_cycles"])
+    n_steps_heat = max(1, int(cfg["t_window_hr"] * 3600.0 / max(1e-6, cfg["dt_sec"])))
+    n_steps_cool = max(1, int(cfg["t_cooldown_hr"] * 3600.0 / max(1e-6, cfg["dt_sec"])))
     total_steps = n_cycles * n_steps_heat + (n_cycles - 1) * n_steps_cool
     total_hr = total_steps * cfg["dt_sec"] / 3600.0
     
@@ -583,7 +576,7 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     cycle_metrics = []
     for c in range(n_cycles):
         eff = (cycle_extracted[c] / cycle_produced[c] * 100.0) if cycle_produced[c] > 0 else 0.0
-        idle_p = (cycle_idle[c] / cfg["t_window_hr"] * 100.0) if cfg["t_window_hr"] > 0 else 0.0
+        idle_p = (cycle_idle[c] / max(1e-6, cfg["t_window_hr"]) * 100.0) if cfg["t_window_hr"] > 0 else 0.0
         cycle_metrics.append({
             "cycle": c + 1,
             "produced_kg": cycle_produced[c],
