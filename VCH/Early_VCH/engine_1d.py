@@ -1,5 +1,5 @@
 # ============================================================
-# engine_1d.py — 1D Radial Physics Engine (Pure Math)
+# engine_1d.py — 1D Radial Physics Engine (Updated Radius Limits)
 # ============================================================
 import numpy as np
 from numba import njit
@@ -7,9 +7,9 @@ from numba import njit
 @njit(cache=True)
 def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
     A = np.pi * (d_in/2.0)**2
-    v = m_dot / (rho * A)
-    Re = rho * v * d_in / mu
-    Pr = mu * cp / k
+    v = m_dot / (max(1e-6, rho) * A)
+    Re = rho * v * d_in / max(1e-6, mu)
+    Pr = mu * cp / max(1e-6, k)
     if Re > 10000.0:
         f = (0.79*np.log(Re) - 1.64)**-2
         Nu = (f/8.0)*(Re - 1000.0)*Pr/(1.0 + 2.17*np.sqrt(f/8.0)*(Pr**(2.0/3.0) - 1.0))
@@ -30,8 +30,8 @@ def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
     
     if has_agitator == 1:
         N_rps = N_rpm / 60.0
-        Re_ia = rho * N_rps * (D_imp**2) / mu
-        Pr = mu * cp / k
+        Re_ia = rho * N_rps * (D_imp**2) / max(1e-6, mu)
+        Pr = mu * cp / max(1e-6, k)
         if ag_type == 1: C, a = 0.60, 0.67
         elif ag_type == 2: C, a = 0.54, 0.67
         elif ag_type == 3: C, a = 0.40, 0.50
@@ -39,10 +39,10 @@ def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
         Nu = C * (Re_ia ** a) * (Pr ** (1.0/3.0)) * visc_corr
         return Nu * k / d_out
     else:
-        nu = mu / rho; alpha = k / (rho * cp); Pr = nu / alpha
+        nu = mu / max(1e-6, rho); alpha = k / max(1e-6, rho * cp); Pr = nu / max(1e-6, alpha)
         d_char = d_out
-        Ra = 9.81 * beta * dT_natural * (d_char**3) / (nu * alpha)
-        Nu = (0.60 + (0.387 * Ra**(1.0/6.0)) / (1.0 + (0.559/Pr)**(9.0/16.0))**(8.0/27.0))**2
+        Ra = 9.81 * beta * dT_natural * (d_char**3) / max(1e-6, nu * alpha)
+        Nu = (0.60 + (0.387 * Ra**(1.0/6.0)) / (1.0 + (0.559/max(1e-6, Pr))**(9.0/16.0))**(8.0/27.0))**2
         return Nu * k / d_char
 
 @njit(cache=True)
@@ -176,7 +176,13 @@ def whole_turns_logspace(n_min, n_max, npts):
 
 def build_geometry(cfg):
     r = cfg["r_inner"]; L = cfg["L_avail"]; d_out = cfg["d_out"]
-    radii = np.linspace(0.33*r, 0.75*r, cfg["N_radii"])
+    
+    # NEW: Expanded radius limits
+    r_min = 0.1 * r
+    r_max = max(r_min, r - 2.0 * d_out) # Ensure max doesn't go below min
+    
+    radii = np.linspace(r_min, r_max, cfg["N_radii"])
+    
     n_max = max(1, int(L/d_out))
     turns = whole_turns_logspace(1, n_max, cfg["n_samples"])
     rows = []
@@ -256,7 +262,7 @@ def run_one(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr, mode):
     M_steel = steel_mass(cfg, 0.5*(cfg["T_amb_low"] + cfg["T_water_in"]))
     A_outer = tank_outer_area(cfg)
     dt = cfg["dt_sec"]
-    n_steps = int(round(t_hr * 3600.0 / dt))
+    n_steps = int(round(t_hr * 3600.0 / max(1e-6, dt)))
 
     if mode == "cool":
         L_coil = 2.0*np.pi*R_coil*n_turns

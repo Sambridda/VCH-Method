@@ -182,10 +182,19 @@ def gather_inputs():
     makeup_T = pf("  Make-up fluid feed temperature degC", 20.0) if has_makeup else 20.0
 
     print("\n--- Tank fluid mass ---")
-    V_tank = np.pi * r_inner**2 * L_avail
+    V_tank = np.pi * r_inner**2 * tank_height # <--- FIXED: Use tank_height
     m_fill = V_tank * float(np.interp(T_amb_low, T_solid_arr, rho_solid_arr))
-    s = input(f"  Enter [f] to fill from geometry ({m_fill:.0f} kg), or mass in kg: ").strip().lower()
-    M_fluid = m_fill if s in ("f", "") else float(s)
+    print(f"  Maximum capacity (to tank rim): {m_fill:.0f} kg")
+    s = input(f"  Enter [f] to fill to max ({m_fill:.0f} kg), or mass in kg: ").strip().lower()
+    if s in ("f", ""):
+        M_fluid = m_fill
+    else:
+        M_fluid = float(s)
+        if M_fluid > m_fill:
+            print(f"  WARNING: {M_fluid:.0f} kg exceeds tank capacity. Capping at {m_fill:.0f} kg.")
+            M_fluid = m_fill
+        elif M_fluid < 0:
+            M_fluid = 0.0
 
     print("\n--- Simulation Settings ---")
     t_window_hr = pf("  Heating window per phase h", 12.0)
