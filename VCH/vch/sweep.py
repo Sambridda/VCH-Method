@@ -1,12 +1,9 @@
 """Sweep: Numba heating kernel, single heating run, phase-A cold sweep and
 phase-D hot run.
-
-Phase A is a multi-core sweep: every simulation is its own task, the tasks go
-into one queue, and a pool of worker *processes* (each with its own interpreter
-and GIL) takes the next free task.  Results come back through `as_completed`, so
-progress is counted in the calling process with no locks or shared memory."""
+"""
 import multiprocessing as mp
 import os
+import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import BrokenExecutor
 
@@ -20,9 +17,6 @@ class Cancelled(Exception):
     """Raised when the user cancels a running phase."""
 
 
-# ------------------------------------------------------------
-# KERNEL
-# ------------------------------------------------------------
 @_jit
 def transient_kernel(H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
                      T_ms, T_me,
@@ -35,7 +29,7 @@ def transient_kernel(H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
                      T_wall_arr, k_wall_arr, cp_wall_arr,
                      A_tank_outer, t_wall, t_ins, k_ins, h_air,
                      T_amb, dt, n_steps,
-                     has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
+                     has_agitator, ag_C, ag_a, N_rpm, D_imp, visc_corr, beta, dT_natural):
     peak_oil = -1e9
     Q_total = 0.0
     peak_Q = 0.0
@@ -63,7 +57,7 @@ def transient_kernel(H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
                                  T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
                                  T_tube_arr, k_tube_arr,
                                  T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-                                 has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural)
+                                 has_agitator, ag_C, ag_a, N_rpm, D_imp, visc_corr, beta, dT_natural)
                 H[i] += Q_local * inj_w[i] * dt_inv_m[i]
                 Q_total += Q_local * inj_w[i] * dt
                 step_Q += Q_local * inj_w[i]
@@ -96,12 +90,7 @@ def transient_kernel(H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
     return H, T_steel, peak_oil, Q_total, peak_Q
 
 
-# ------------------------------------------------------------
-# ONE HEATING RUN
-# ------------------------------------------------------------
 def run_heat(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr):
-    """Heat the tank for t_hr hours.  T_initial=None means a cold start from
-    ambient; otherwise a dict with the residual state {"H", "T_steel"}."""
     N = cfg["N"]
     T_ref_mesh = T_amb if T_initial is None else float(T_initial["T_steel"])
     dr, r_in, r_out, r_mid, A_face, m_shell = prepare_mesh(cfg, mat, T_ref_mesh)
@@ -138,7 +127,7 @@ def run_heat(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr):
         cfg["T_wall_arr"], cfg["k_wall_arr"], cfg["cp_wall_arr"],
         A_outer, cfg["t_wall"], cfg["t_ins"], cfg["k_ins"], cfg["h_air"],
         T_amb, dt, n_steps,
-        cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"],
+        cfg["has_agitator"], cfg["ag_C"], cfg["ag_a"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"],
         cfg["beta_liq"], cfg["dT_natural"])
 
     return pack_result(cfg, mat, R_coil, n_turns, H_out, T_steel, m_shell,
@@ -150,13 +139,7 @@ def _check(cancel):
         raise Cancelled()
 
 
-# ------------------------------------------------------------
-# PHASE A: COLD SWEEP (all designs x 3 ambients, multi-core)
-# ------------------------------------------------------------
 def default_workers():
-    """Worker processes to use: all cores (max 8), leaving one free for the window
-    on machines with 4+ cores.  Set the environment variable VCH_WORKERS to override
-    (VCH_WORKERS=1 runs everything in-process)."""
     env = os.environ.get("VCH_WORKERS", "").strip()
     if env.isdigit() and int(env) >= 1:
         return int(env)
@@ -165,15 +148,10 @@ def default_workers():
 
 
 def warm_up(cfg, mat):
-    """Zero-length heating run.  The first time on a machine it compiles the Numba
-    kernel and writes it to the on-disk cache; afterwards it just loads it.  Run in
-    the calling process *before* the workers start, so they never compile (several
-    processes compiling at once can deadlock on the cache files)."""
     run_heat(cfg, mat, 0.5 * cfg["r_inner"], 3, cfg["T_amb_low"], None, 0.0)
 
 
 def _cold_run(cfg, mat, task):
-    """One simulation = one task: (index, preset, T_amb, R, n, R_ratio)."""
     idx, pname, Tamb, R, n, R_ratio = task
     r = run_heat(cfg, mat, R, n, Tamb, None, cfg["t_window_hr"])
     r["T_amb"] = Tamb; r["preset"] = pname; r["start_type"] = "cold"
@@ -181,20 +159,35 @@ def _cold_run(cfg, mat, task):
     return idx, r
 
 
-# ---- code that runs inside each worker process ----------------------------
 _W = {}
 
+def _report(kind, **kw):
+    q = _W.get("status_q")
+    if q is None:
+        return
+    kw.update(kind=kind, pid=_W["pid"],
+              t_wall=time.perf_counter(), t_cpu=time.process_time())
+    try:
+        q.put_nowait(kw)
+    except Exception:
+        pass
 
-def _init_worker(cfg, mat):
+def _init_worker(cfg, mat, status_q=None):
     _W["cfg"], _W["mat"] = cfg, mat
-    warm_up(cfg, mat)  # loads the compiled kernel from the cache (no compiling)
-
+    _W["status_q"], _W["pid"] = status_q, os.getpid()
+    _report("init")
+    warm_up(cfg, mat)
+    _report("ready")
 
 def _sweep_task(task):
-    return _cold_run(_W["cfg"], _W["mat"], task)
+    idx = task[0]
+    _report("start", idx=idx)
+    try:
+        return _cold_run(_W["cfg"], _W["mat"], task)
+    finally:
+        _report("end", idx=idx)
 
 
-# ---- the three ways to execute the task list --------------------------------
 def _count(results):
     return sum(r is not None for r in results)
 
@@ -223,24 +216,26 @@ def _run_threads(cfg, mat, tasks, results, tick, cancel, workers):
 
 
 def _stop_pool(ex):
-    """Drop queued tasks and stop the workers now (cancel / error).  The worker
-    handles are taken first: shutdown() clears the executor's process table."""
     procs = list((getattr(ex, "_processes", None) or {}).values())
     ex.shutdown(wait=False, cancel_futures=True)
     for p in procs:
-        try:
-            p.terminate()
-        except Exception:  # noqa: BLE001
-            pass
+        try: p.terminate()
+        except Exception: pass
 
 
-def _run_processes(cfg, mat, tasks, results, tick, cancel, workers):
-    # "spawn" everywhere: the same start method Windows uses, and safe next to Qt threads
-    ex = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"),
-                             initializer=_init_worker, initargs=(cfg, mat))
+def _run_processes(cfg, mat, tasks, results, tick, cancel, workers, monitor=None):
+    ctx = mp.get_context("spawn")
+    status_q = ctx.Queue() if monitor is not None else None
+    
+    if monitor is not None:
+        monitor.start(status_q)
+
+    ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                             initializer=_init_worker,
+                             initargs=(cfg, mat, status_q))
     try:
-        futs = [ex.submit(_sweep_task, t) for t in tasks]      # whole queue at once
-        for f in as_completed(futs):                           # each result the moment it ends
+        futs = [ex.submit(_sweep_task, t) for t in tasks]
+        for f in as_completed(futs):
             _check(cancel)
             idx, r = f.result()
             results[idx] = r
@@ -248,15 +243,16 @@ def _run_processes(cfg, mat, tasks, results, tick, cancel, workers):
     except BaseException:
         _stop_pool(ex)
         raise
-    ex.shutdown(wait=True)
+    finally:
+        ex.shutdown(wait=True)
+        if monitor is not None: monitor.stop()
+        if status_q is not None:
+            status_q.close()
+            status_q.join_thread()
 
 
 def run_cold_sweep(cfg, mat, geom, presets, progress=None, cancel=None,
-                   workers=None, mode="process"):
-    """Heat every (R, n) design from a cold start at every ambient.
-    Returns rows in P6 order: preset-major, then design order.
-    mode: "process" (default; falls back to threads if processes cannot start),
-          "thread", or "sequential"."""
+                   workers=None, mode="process", monitor=None):
     combos = [(pname, Tamb, g) for pname, Tamb in presets for g in geom]
     tasks = [(i, p, T, g["R"], g["n"], g["R_ratio"]) for i, (p, T, g) in enumerate(combos)]
     total = len(tasks)
@@ -264,8 +260,7 @@ def run_cold_sweep(cfg, mat, geom, presets, progress=None, cancel=None,
     workers = max(1, min(workers or default_workers(), total))
 
     def tick(done, msg=""):
-        if progress:
-            progress(done, total, msg)
+        if progress: progress(done, total, msg)
 
     _check(cancel)
     tick(0, "Preparing the solver (compiles on first use)...")
@@ -279,7 +274,7 @@ def run_cold_sweep(cfg, mat, geom, presets, progress=None, cancel=None,
     if mode == "process":
         tick(0, f"Starting {workers} worker processes...")
         try:
-            _run_processes(cfg, mat, tasks, results, tick, cancel, workers)
+            _run_processes(cfg, mat, tasks, results, tick, cancel, workers, monitor=monitor)
             return results
         except Cancelled:
             raise
@@ -292,9 +287,6 @@ def run_cold_sweep(cfg, mat, geom, presets, progress=None, cancel=None,
     return results
 
 
-# ------------------------------------------------------------
-# PHASE D: HOT RUN (selected coil, from the cooldown residual state)
-# ------------------------------------------------------------
 def run_hot(cfg, mat, R, n, presets, cool_states, progress=None, cancel=None):
     hot_rows = []
     total = len(presets)
@@ -304,6 +296,5 @@ def run_hot(cfg, mat, R, n, presets, cool_states, progress=None, cancel=None):
         r["T_amb"] = Tamb; r["preset"] = pname; r["start_type"] = "hot"
         r["R_ratio"] = R / cfg["r_inner"]
         hot_rows.append(r)
-        if progress:
-            progress(k + 1, total, f"hot run {pname}")
+        if progress: progress(k + 1, total, f"hot run {pname}")
     return hot_rows

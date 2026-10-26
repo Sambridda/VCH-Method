@@ -1,4 +1,6 @@
 numpy
 numba
-matplotlib
 PySide6
+matplotlib
+psutil
+openpyxl

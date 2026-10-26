@@ -4,8 +4,6 @@ Phase A output (written first, before the user picks a coil):
     cold_low.png, cold_mid.png, cold_hot.png, picker_menu.txt
 Final output (written once, after phase D):
     hot_start.png, selected_summary.png, results.csv, index.html
-No CSV is written for the cold sweep, the pick, the cooldown or the hot run on
-their own: those rows only appear in the final results.csv and index.html.
 """
 import base64
 import os
@@ -141,8 +139,6 @@ def plot_selected_summary(cold_at_selected, cool_reports, hot_rows, presets,
 # PHASE A OUTPUT (written first)
 # ============================================================
 def build_menu(radii, geom, cold_rows):
-    """The designs the user picks from: one row per (R, n) with liquid mass at
-    each ambient."""
     menu = []
     for ri, R in enumerate(radii, 1):
         for g in sorted([g for g in geom if g["R"] == R], key=lambda x: x["n"]):
@@ -161,7 +157,6 @@ def build_menu(radii, geom, cold_rows):
 
 
 def write_phase_a(outdir, cfg, cold_rows, geom, radii, presets):
-    """Cold graphs + picker_menu.txt.  Returns the menu."""
     os.makedirs(outdir, exist_ok=True)
     for pname, Tamb in presets:
         rows = [r for r in cold_rows if r["preset"] == pname]
@@ -212,8 +207,6 @@ def _T_band(r, cfg, mat, R_ag):
 
 def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected,
                       cool_reports, hot_rows, presets, pngs):
-    """index.html - same six sections as the reference; the graphs are embedded
-    in the page itself so it still works when moved on its own."""
     mat = cfg["_mat"]
     cp = coil_properties(cfg, R_ag, n_ag)
     U_ref = wall_U_at_T(cfg, cfg["T_water_in"])
@@ -356,7 +349,6 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected,
 
 
 def final_report_text(cfg, R_ag, n_ag, cold_at_selected, cool_reports, hot_rows, presets):
-    """Plain-text version of the report, shown in the app's results tab."""
     mat = cfg["_mat"]
     cp = coil_properties(cfg, R_ag, n_ag)
     U_ref = wall_U_at_T(cfg, cfg["T_water_in"])
@@ -414,8 +406,6 @@ def final_report_text(cfg, R_ag, n_ag, cold_at_selected, cool_reports, hot_rows,
 
 def write_final(outdir, cfg, R_ag, n_ag, cold_rows, cold_at_selected,
                 cool_reports, hot_rows, presets):
-    """hot_start.png, selected_summary.png, results.csv, index.html.
-    The cold rows from phase A are carried into results.csv."""
     plot_hot(hot_rows, os.path.join(outdir, "hot_start.png"), cfg["t_window_hr"])
     plot_selected_summary(cold_at_selected, cool_reports, hot_rows, presets,
                           os.path.join(outdir, "selected_summary.png"),

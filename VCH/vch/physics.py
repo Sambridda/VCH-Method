@@ -1,18 +1,11 @@
 """Physics: material tables, enthalpy <-> temperature, oil / water properties,
 internal and external film coefficients and the epsilon-NTU coil duty.
-
-Everything here is a direct port of P6.  The heavy functions are Numba-safe
-(`njit`) so the sweep kernels in sweep.py / cooldown.py can call them.
 """
 import numpy as np
 from numba import njit
 
-# Cached + GIL-free so Phase A can run several designs in parallel threads.
 _jit = njit(cache=True, nogil=True)
 
-# ------------------------------------------------------------
-# WATER REFERENCE TABLE (10-100 degC)
-# ------------------------------------------------------------
 WATER_T = np.array([10., 20., 30., 40., 50., 60., 70., 80., 90., 100.])
 WATER_RHO = np.array([999.7, 998.2, 995.7, 992.2, 988.0, 983.2, 977.8, 971.8, 965.3, 958.4])
 WATER_CP = np.array([4192., 4182., 4178., 4179., 4181., 4184., 4187., 4197., 4205., 4216.])
@@ -21,9 +14,6 @@ WATER_MU = np.array([1.308e-3, 1.002e-3, 7.98e-4, 6.53e-4, 5.47e-4,
 WATER_K = np.array([0.580, 0.598, 0.615, 0.631, 0.644, 0.654, 0.663, 0.670, 0.675, 0.679])
 
 
-# ------------------------------------------------------------
-# MATERIAL TABLES (enthalpy method)
-# ------------------------------------------------------------
 def build_material_tables(cfg):
     T_ms = cfg["T_ms"]; T_me = cfg["T_me"]; Hfus = cfg["Hfus"]
     T_amb_low = cfg["T_amb_low"]; T_water_in = cfg["T_water_in"]
@@ -72,7 +62,7 @@ def build_material_tables(cfg):
             rho_grid[i] = rho_s_end * (1 - f) + rho_l_start * f
             cp_sens_grid[i] = cp_s_end * (1 - f) + cp_l_start * f
             k_grid[i] = k_s_end * (1 - f) + k_l_start * f
-            mu_grid[i] = mu_l_start  # liquid viscosity for slurry flow
+            mu_grid[i] = mu_l_start
             cp_eff_grid[i] = cp_sens_grid[i] + Hfus_over_dT
 
     H_grid = np.zeros(n_g)
@@ -83,9 +73,6 @@ def build_material_tables(cfg):
                 rho_grid=rho_grid, cp_sens_grid=cp_sens_grid, k_grid=k_grid, mu_grid=mu_grid)
 
 
-# ------------------------------------------------------------
-# HEAT TRANSFER
-# ------------------------------------------------------------
 @_jit
 def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
     A = np.pi * (d_in / 2.0) ** 2
@@ -95,7 +82,7 @@ def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
     if Re > 10000.0:
         f = (0.79 * np.log(Re) - 1.64) ** -2
         Nu = (f / 8.0) * (Re - 1000.0) * Pr / (1.0 + 2.17 * np.sqrt(f / 8.0) * (Pr ** (2.0 / 3.0) - 1.0))
-        Nu *= (1.0 + (d_in / d_coil_actual) ** 0.9)  # actual helix diameter
+        Nu *= (1.0 + (d_in / d_coil_actual) ** 0.9)
     else:
         Nu = 4.36
     return Nu * k / d_in
@@ -103,9 +90,9 @@ def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
 
 @_jit
 def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
-               has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out):
+               has_agitator, ag_C, ag_a, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out):
     if T_oil < T_ms and has_agitator == 0:
-        return 5.0  # unagitated solid
+        return 5.0
 
     rho = np.interp(T_oil, T_grid, rho_grid)
     cp = np.interp(T_oil, T_grid, cp_grid)
@@ -116,21 +103,13 @@ def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
         N_rps = N_rpm / 60.0
         Re_ia = rho * N_rps * (D_imp ** 2) / mu
         Pr = mu * cp / k
-        if ag_type == 1:
-            C, a = 0.60, 0.67
-        elif ag_type == 2:
-            C, a = 0.54, 0.67
-        elif ag_type == 3:
-            C, a = 0.40, 0.50
-        else:
-            C, a = 0.35, 0.50
-        Nu = C * (Re_ia ** a) * (Pr ** (1.0 / 3.0)) * visc_corr
+        Nu = ag_C * (Re_ia ** ag_a) * (Pr ** (1.0 / 3.0)) * visc_corr
         return Nu * k / d_out
     else:
         nu = mu / rho
         alpha = k / (rho * cp)
         Pr = nu / alpha
-        d_char = d_out  # tube OD for natural convection
+        d_char = d_out
         Ra = 9.81 * beta * dT_natural * (d_char ** 3) / (nu * alpha)
         Nu = (0.60 + (0.387 * Ra ** (1.0 / 6.0)) / (1.0 + (0.559 / Pr) ** (9.0 / 16.0)) ** (8.0 / 27.0)) ** 2
         return Nu * k / d_char
@@ -141,8 +120,7 @@ def calc_Q(m_dot, T_band, T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actua
            T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
            T_tube_arr, k_tube_arr,
            T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-           has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
-    """Coil duty (W) by the epsilon-NTU method."""
+           has_agitator, ag_C, ag_a, N_rpm, D_imp, visc_corr, beta, dT_natural):
     if T_band >= T_water_in:
         return 0.0
     T_eff = 0.5 * (T_water_in + T_band)
@@ -155,7 +133,7 @@ def calc_Q(m_dot, T_band, T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actua
 
     h_in = h_internal(m_dot, d_in, d_coil_actual, rho_c, cp_c, mu_c, k_c)
     h_out = h_external(T_band, T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-                       has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out)
+                       has_agitator, ag_C, ag_a, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out)
 
     R_in = 1.0 / h_in
     R_wall = (d_out * np.log(d_out / d_in)) / (2.0 * k_tube)
@@ -165,16 +143,11 @@ def calc_Q(m_dot, T_band, T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actua
     return eps * m_dot * cp_c * (T_water_in - T_band)
 
 
-# ------------------------------------------------------------
-# STATE HELPERS (enthalpy -> temperature, phase classification)
-# ------------------------------------------------------------
 def H_to_T(H, mat):
-    """Enthalpy (scalar or array) -> temperature (degC)."""
     return np.interp(H, mat["H_grid"], mat["T_grid"])
 
 
 def classify(cfg, mat, H, m_shell):
-    """Split the tank into liquid / slurry / solid mass and mass-average T."""
     N = cfg["N"]
     liq = slu = sol = 0.0
     liqT = sluT = solT = 0.0
@@ -203,7 +176,6 @@ def avg_T(r):
 
 def pack_result(cfg, mat, R_coil, n_turns, H_out, T_steel, m_shell, T_initial,
                 peak_oil, Q_total, peak_Q):
-    """Result record shared by heating runs and cooldown runs."""
     st = classify(cfg, mat, H_out, m_shell)
     if T_initial is not None:
         st0 = classify(cfg, mat, np.array(T_initial["H"]), m_shell)

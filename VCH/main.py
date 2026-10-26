@@ -1,12 +1,4 @@
-"""Tank coil design simulation - desktop application (P6 engine).
-
-Flow:   inputs -> Phase A (cold sweep, writes its own output first)
-        -> Phase B (user picks one coil) -> Phase C (cooldown) -> Phase D (hot run)
-        -> final results.csv + index.html (with all graphs).
-
-main.py owns the window, the background runner and the picker; the numerical
-work lives in the vch/ package.
-"""
+"""Tank coil design simulation - desktop application (P6 engine)."""
 import io
 import multiprocessing
 import os
@@ -25,6 +17,7 @@ from vch.physics import build_material_tables
 from vch.geometry import build_geometry
 from vch.sweep import run_cold_sweep, run_hot, run_heat, default_workers, Cancelled
 from vch.cooldown import run_cooldowns, run_cool
+from vch.resource_monitor import WorkerMonitor
 
 APP_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 OUT_ROOT = APP_DIR / "out"
@@ -40,15 +33,7 @@ QProgressBar { border:1px solid #bbb; border-radius:4px; text-align:center; heig
 QProgressBar::chunk { background:#2f7fc1; }
 """
 
-
-# ============================================================
-# START-UP WARM-UP
-# ============================================================
 def warm_up_engine(app):
-    """Compile (or load from cache) the Numba kernels and initialise the plotting
-    backend on the main thread, so the background workers only ever run code that
-    is already compiled.  The first start on a machine takes longer (compiling);
-    later starts reuse the cache."""
     splash = QtWidgets.QLabel("Preparing the numerical engine...\n\n"
                               "The first start on this computer compiles the solver and can take\n"
                               "up to a minute. Later starts are almost instant.")
@@ -71,12 +56,9 @@ def warm_up_engine(app):
     finally:
         splash.close()
 
-
-# ============================================================
-# BACKGROUND WORKERS (the window never blocks on the engine)
-# ============================================================
 class PhaseAWorker(QThread):
     progress = Signal(int, int, str)
+    workers_snapshot = Signal(object)
     done = Signal(object)
     failed = Signal(str)
     cancelled = Signal()
@@ -93,18 +75,22 @@ class PhaseAWorker(QThread):
             cfg["_mat"] = mat
             geom, n_max, radii, turns = build_geometry(cfg)
             presets = [("low", cfg["T_amb_low"]), ("mid", cfg["T_amb_mid"]), ("hot", cfg["T_amb_hot"])]
+            
+            mon = WorkerMonitor(interval=1.0)
+            mon.on_snapshot = self.workers_snapshot.emit
+            
             cold_rows = run_cold_sweep(cfg, mat, geom, presets,
                                        progress=lambda d, t, m: self.progress.emit(d, t, m),
-                                       cancel=self.cancel_event)
+                                       cancel=self.cancel_event,
+                                       monitor=mon)
             self.progress.emit(len(cold_rows), len(cold_rows), "Writing Phase A output (graphs + picker menu)...")
             menu = post.write_phase_a(self.outdir, cfg, cold_rows, geom, radii, presets)
             self.done.emit(dict(mat=mat, geom=geom, radii=radii, turns=turns, presets=presets,
                                 cold_rows=cold_rows, menu=menu))
         except Cancelled:
             self.cancelled.emit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             self.failed.emit(traceback.format_exc())
-
 
 class PhaseCDWorker(QThread):
     progress = Signal(int, int, str)
@@ -139,16 +125,10 @@ class PhaseCDWorker(QThread):
             self.done.emit(res)
         except Cancelled:
             self.cancelled.emit()
-        except Exception:  # noqa: BLE001
+        except Exception:
             self.failed.emit(traceback.format_exc())
 
-
-# ============================================================
-# SMALL WIDGETS
-# ============================================================
 class ScaledImage(QtWidgets.QLabel):
-    """Shows a picture scaled to the available space, keeping its aspect ratio."""
-
     def __init__(self):
         super().__init__()
         self._pm = None
@@ -169,7 +149,6 @@ class ScaledImage(QtWidgets.QLabel):
         self._rescale()
         super().resizeEvent(e)
 
-
 def image_tabs(names, folder):
     tabs = QtWidgets.QTabWidget()
     for name in names:
@@ -180,10 +159,8 @@ def image_tabs(names, folder):
         tabs.addTab(img, name.replace(".png", ""))
     return tabs
 
-
 def open_path(path):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
-
 
 class ProgressPage(QtWidgets.QWidget):
     cancel_requested = Signal()
@@ -197,23 +174,42 @@ class ProgressPage(QtWidgets.QWidget):
         self.status = QtWidgets.QLabel("")
         self.bar = QtWidgets.QProgressBar()
         self.eta = QtWidgets.QLabel("")
+        
+        self.cores_label = QtWidgets.QLabel("")
+        
+        self.worker_table = QtWidgets.QTableWidget(0, 7)
+        self.worker_table.setHorizontalHeaderLabels(
+            ["#", "PID", "State", "Task", "Done", "CPU s", "Utilization"])
+        self.worker_table.verticalHeader().setVisible(False)
+        self.worker_table.verticalHeader().setDefaultSectionSize(26)
+        self.worker_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.worker_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.worker_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.worker_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.worker_table.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        
         self.log = QtWidgets.QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
         self.btn_cancel = QtWidgets.QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self.cancel_requested)
-        for w in (self.title, self.status, self.bar, self.eta, self.log):
+        
+        for w in (self.title, self.status, self.bar, self.eta, self.cores_label, self.worker_table, self.log):
             lay.addWidget(w)
         lay.addWidget(self.btn_cancel, alignment=Qt.AlignmentFlag.AlignRight)
         self._t0 = time.time()
 
-    def start(self, title, first_message):
+    def start(self, title, first_message, show_workers=False):
         self.title.setText(title)
         self.status.setText(first_message)
         self.bar.setRange(0, 100); self.bar.setValue(0)
         self.eta.setText("")
         self.log.clear()
         self.btn_cancel.setEnabled(True)
+        self.worker_table.setVisible(show_workers)
+        self.cores_label.setVisible(show_workers)
+        self.worker_table.setRowCount(0)
+        self.cores_label.setText("")
         self._t0 = time.time()
         self.log_line(first_message)
 
@@ -233,10 +229,44 @@ class ProgressPage(QtWidgets.QWidget):
             self.status.setText(msg)
             self.log_line(msg)
 
+    def update_workers(self, snap):
+        t = self.worker_table
+        if t.rowCount() != len(snap):
+            t.setRowCount(len(snap))
+            header_h = t.horizontalHeader().height()
+            row_h = t.verticalHeader().defaultSectionSize()
+            total_h = header_h + (len(snap) * row_h) + 4
+            t.setFixedHeight(total_h)
+            
+        for r, w in enumerate(snap):
+            vals = [str(w["slot"]), str(w["pid"]), w["state"],
+                    str(w["task"]) if w["task"] is not None else "-",
+                    str(w["done"]), f"{w['cpu_busy']:.1f}",
+                    f"{100*w['utilization']:.0f}%"]
+            
+            for c, v in enumerate(vals):
+                it = t.item(r, c)
+                if it is None:
+                    it = QtWidgets.QTableWidgetItem()
+                    t.setItem(r, c, it)
+                
+                it.setText(v)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                it.setForeground(QtGui.QColor(20, 20, 20))
+                
+            color = {"running": QtGui.QColor(214, 238, 214),
+                     "idle":    QtGui.QColor(255, 244, 200),
+                     "starting": QtGui.QColor(230, 230, 230)}.get(w["state"])
+            
+            if color:
+                for c in range(t.columnCount()):
+                    t.item(r, c).setBackground(color)
+                    
+        busy = sum(w["utilization"] for w in snap)
+        self.cores_label.setText(
+            f"Cores busy (wall-average): {busy:.2f} / {os.cpu_count()} logical"
+            f"   —   {len(snap)} workers")
 
-# ============================================================
-# MAIN WINDOW
-# ============================================================
 class MainWindow(QtWidgets.QMainWindow):
     TAB_INPUTS, TAB_A, TAB_PICK, TAB_RESULTS = range(4)
 
@@ -253,20 +283,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        # 1 inputs
         self.form = inputs.InputsForm()
         self.form.confirmed.connect(self.start_phase_a)
         self.tabs.addTab(self.form, "1  Inputs")
 
-        # 2 phase A progress
         self.page_a = ProgressPage()
         self.page_a.cancel_requested.connect(self.cancel_worker)
         self.tabs.addTab(self.page_a, "2  Phase A: cold sweep")
 
-        # 3 phase B picker
         self.tabs.addTab(self._build_pick_page(), "3  Phase B: pick coil")
 
-        # 4 phases C/D + results
         self.page_cd = ProgressPage()
         self.page_cd.cancel_requested.connect(self.cancel_worker)
         self.results_box = QtWidgets.QWidget()
@@ -284,10 +310,9 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 self.form.set_inputs(inputs.load_inputs(str(LAST_INPUTS)))
                 self.statusBar().showMessage("Restored your last inputs.")
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
-    # ---- picker page ---------------------------------------------------------
     def _build_pick_page(self):
         page = QtWidgets.QWidget()
         lay = QtWidgets.QVBoxLayout(page)
@@ -337,6 +362,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _fill_picker(self):
         cfg, menu, presets = self.cfg, self.menu, self.study["presets"]
         t = self.pick_table
+        t.clearContents()
         t.setRowCount(len(menu))
         t.setHorizontalHeaderLabels(
             ["idx", "R (m)", "n", "L (m)"]
@@ -351,6 +377,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 key = ("liq_low", "liq_mid", "liq_hot")[c - 4] if c >= 4 else None
                 if key and m[key] >= best[key] - 1e-9 and best[key] > 0:
                     it.setBackground(QtGui.QColor(214, 238, 214))
+                    it.setForeground(QtGui.QColor(20, 20, 20))
                     f = it.font(); f.setBold(True); it.setFont(f)
                 t.setItem(i, c, it)
         t.clearSelection()
@@ -374,7 +401,6 @@ class MainWindow(QtWidgets.QMainWindow):
         rows = self.pick_table.selectionModel().selectedRows()
         return self.menu[rows[0].row()] if rows else None
 
-    # ---- flow ------------------------------------------------------------------
     def start_phase_a(self, cfg, inp):
         try:
             inputs.save_inputs(str(LAST_INPUTS), inp)
@@ -390,14 +416,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabEnabled(self.TAB_RESULTS, False)
         self.tabs.setTabEnabled(self.TAB_A, True)
         self.tabs.setCurrentIndex(self.TAB_A)
+        
         self.page_a.start("Phase A - cold-start sweep",
-                          f"Output folder: {self.outdir}")
+                          f"Output folder: {self.outdir}", show_workers=True)
+        
         self.page_a.log_line(f"Using up to {default_workers()} worker process(es) "
                              f"({os.cpu_count()} CPU cores detected).")
         self.statusBar().showMessage("Phase A running...")
 
         self.worker = PhaseAWorker(cfg, self.outdir)
         self.worker.progress.connect(self.page_a.update_progress)
+        self.worker.workers_snapshot.connect(self.page_a.update_workers)
         self.worker.done.connect(self._phase_a_done)
         self.worker.failed.connect(lambda tb: self._failed(tb, self.TAB_INPUTS))
         self.worker.cancelled.connect(lambda: self._cancelled(self.TAB_INPUTS))
@@ -424,9 +453,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabEnabled(self.TAB_RESULTS, True)
         self.stack.setCurrentWidget(self.page_cd)
         self.tabs.setCurrentIndex(self.TAB_RESULTS)
+        
         self.page_cd.start(
             f"Phases C & D - R = {choice['R']:.3f} m, n = {choice['n']}",
-            f"Cooldown of {self.cfg['t_cooldown_hr']:.1f} h, then hot run of {self.cfg['t_window_hr']:.1f} h...")
+            f"Cooldown of {self.cfg['t_cooldown_hr']:.1f} h, then hot run of {self.cfg['t_window_hr']:.1f} h...",
+            show_workers=False)
+        
         self.statusBar().showMessage("Phases C and D running...")
 
         self.worker = PhaseCDWorker(self.cfg, self.study, choice, self.outdir)
@@ -489,7 +521,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def back_to_inputs(self):
         self.tabs.setCurrentIndex(self.TAB_INPUTS)
 
-    # ---- cancel / failure / close --------------------------------------------
     def cancel_worker(self):
         if self.worker is not None:
             self.worker.cancel_event.set()
@@ -521,9 +552,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.wait(8000)
         event.accept()
 
-
 def main():
-    multiprocessing.freeze_support()  # needed for packaged Windows builds
+    multiprocessing.freeze_support()
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
@@ -531,7 +561,6 @@ def main():
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()

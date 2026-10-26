@@ -1,15 +1,9 @@
-"""Cooldown: radial conduction with no coil power.  The coil's metal and water
-stay in the tank as a lumped (stagnant) heat capacity at the coil cells."""
+"""Cooldown: radial conduction with no coil power."""
 import numpy as np
-
 from .physics import _jit, pack_result
 from .geometry import (prepare_mesh, injection_weights, steel_mass, tank_outer_area)
 from .sweep import Cancelled, _check
 
-
-# ------------------------------------------------------------
-# KERNEL
-# ------------------------------------------------------------
 @_jit
 def cooldown_kernel(H, T_steel, N, dr, dt_inv_m_eff, A_face,
                     T_grid, H_grid, k_grid,
@@ -42,14 +36,7 @@ def cooldown_kernel(H, T_steel, N, dr, dt_inv_m_eff, A_face,
         T_steel += (Q_os - Q_sa) * dt / (M_steel * cp_wall_now)
     return H, T_steel
 
-
-# ------------------------------------------------------------
-# ONE COOLDOWN RUN
-# ------------------------------------------------------------
 def run_cool(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr):
-    """Cool the tank for t_hr hours from the state in T_initial
-    ({"H": enthalpy per cell, "T_steel": wall temperature}).  A cooldown always
-    starts from an existing state (the cold-run end state), never from ambient."""
     if T_initial is None:
         raise ValueError("run_cool needs a start state (the cold-run end state); got None.")
     N = cfg["N"]
@@ -65,7 +52,6 @@ def run_cool(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr):
     dt = cfg["dt_sec"]
     n_steps = int(round(t_hr * 3600.0 / dt))
 
-    # stagnant coil: metal + water, expressed as extra oil-equivalent mass
     L_coil = 2.0 * np.pi * R_coil * n_turns
     V_metal = np.pi * 0.25 * (cfg["d_out"] ** 2 - cfg["d_in"] ** 2) * L_coil
     V_water = np.pi * 0.25 * cfg["d_in"] ** 2 * L_coil
@@ -91,13 +77,7 @@ def run_cool(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr):
     return pack_result(cfg, mat, R_coil, n_turns, H_out, T_steel, m_shell,
                        T_initial, 0.0, 0.0, 0.0)
 
-
-# ------------------------------------------------------------
-# PHASE C: COOLDOWN OF THE SELECTED COIL AT EVERY AMBIENT
-# ------------------------------------------------------------
 def run_cooldowns(cfg, mat, R, n, presets, cold_rows, progress=None, cancel=None):
-    """Start from each ambient's cold-run end state for the selected coil.
-    Returns (cold_at_selected, cool_states, cool_reports)."""
     cold_at_selected = {}; cool_states = {}; cool_reports = {}
     total = len(presets)
     for k, (pname, Tamb) in enumerate(presets):
@@ -110,6 +90,5 @@ def run_cooldowns(cfg, mat, R, n, presets, cold_rows, progress=None, cancel=None
         r = run_cool(cfg, mat, R, n, Tamb, T_ini, cfg["t_cooldown_hr"])
         cool_states[pname] = {"H": r["H_final"], "T_steel": r["T_steel"]}
         cool_reports[pname] = r
-        if progress:
-            progress(k + 1, total, f"cooldown {pname}")
+        if progress: progress(k + 1, total, f"cooldown {pname}")
     return cold_at_selected, cool_states, cool_reports
