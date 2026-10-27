@@ -1,45 +1,25 @@
-"""Post-processing.
-
-Phase A output (written first, before the user picks a coil):
-    cold_low.png, cold_mid.png, cold_hot.png, picker_menu.txt
-Final output (written once, after phase D):
-    hot_start.png, selected_summary.png, results.csv, index.html
-"""
+"""Post-processing."""
 import base64
 import os
-
 import numpy as np
 import matplotlib
 from matplotlib.figure import Figure
-
 from .physics import H_to_T, avg_T, wall_U_at_T
 from .geometry import coil_properties, coil_index
 
 CSV_KEYS = ["phase", "preset", "T_amb", "start_type", "R", "R_ratio", "n", "L_coil", "A_coil",
-            "liquid_0", "slurry_0", "solid_0",
-            "liquid", "slurry", "solid", "liquid_change",
-            "liquid_T", "slurry_T", "solid_T",
-            "peak_oil", "energy_kWh", "peak_power_kW"]
+            "liquid_0", "slurry_0", "solid_0", "liquid", "slurry", "solid", "liquid_change",
+            "liquid_T", "slurry_T", "solid_T", "peak_oil", "energy_kWh", "peak_power_kW"]
 
-PNG_NAMES = ["cold_low.png", "cold_mid.png", "cold_hot.png",
-             "hot_start.png", "selected_summary.png"]
-
+PNG_NAMES = ["cold_low.png", "cold_mid.png", "cold_hot.png", "hot_start.png", "selected_summary.png"]
 CRLF = "\r\n"
 
-
 def _viridis(n):
-    cmap = matplotlib.colormaps["viridis"] if hasattr(matplotlib, "colormaps") \
-        else matplotlib.cm.get_cmap("viridis")
+    cmap = matplotlib.colormaps["viridis"] if hasattr(matplotlib, "colormaps") else matplotlib.cm.get_cmap("viridis")
     return cmap(np.linspace(0.1, 0.9, n))
 
-
-# ============================================================
-# CSV
-# ============================================================
 def write_csv(rows, path):
-    """Same 22 columns and Windows line endings as the reference results.csv."""
-    if not rows:
-        return
+    if not rows: return
     lines = [",".join(CSV_KEYS)]
     for r in rows:
         d = dict(r)
@@ -48,10 +28,6 @@ def write_csv(rows, path):
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(CRLF.join(lines) + CRLF)
 
-
-# ============================================================
-# PLOTS (matplotlib Figure API: safe to call from a worker thread)
-# ============================================================
 def plot_cold(rows, T_amb, out_path, t_window_hr):
     fig = Figure(figsize=(11, 9))
     ax1, ax2 = fig.subplots(2, 1)
@@ -68,13 +44,11 @@ def plot_cold(rows, T_amb, out_path, t_window_hr):
         ax2.plot(L, [r["slurry_T"] for r in sub], "--", color=colors[j], label=f"{lbl} slu T")
         ax2.plot(L, [r["solid_T"] for r in sub], ":", color=colors[j], label=f"{lbl} sol T")
     ax1.set_ylabel("Mass (kg)")
-    ax1.set_title(f"Cold start — ambient {T_amb} degC, {t_window_hr:.1f} h heating — "
-                  f"L=liquid, S=slurry, Sol=solid")
+    ax1.set_title(f"Cold start — ambient {T_amb} degC, {t_window_hr:.1f} h heating — L=liquid, S=slurry, Sol=solid")
     ax1.legend(fontsize=7, ncol=3, loc="upper left"); ax1.grid(True, alpha=0.3)
     ax2.set_xlabel("Coil length (m)"); ax2.set_ylabel("Avg T (degC)")
     ax2.legend(fontsize=6, ncol=3, loc="best"); ax2.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_path, dpi=130)
-
 
 def plot_hot(rows, out_path, t_window_hr):
     fig = Figure(figsize=(10, 9))
@@ -97,16 +71,13 @@ def plot_hot(rows, out_path, t_window_hr):
     ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_path, dpi=130)
 
-
 def plot_selected_summary(cold_at_selected, cool_reports, hot_rows, presets,
                           out_path, R_ag, n_ag, t_window_hr, t_cooldown_hr):
     fig = Figure(figsize=(16, 6))
     axes = fig.subplots(1, 3)
     labels = [f"{p}\n{T} C" for p, T in presets]
     x = np.arange(3)
-    phases = [("liquid", "tab:blue", "liquid"),
-              ("slurry", "tab:orange", "slurry"),
-              ("solid", "tab:gray", "solid")]
+    phases = [("liquid", "tab:blue", "liquid"), ("slurry", "tab:orange", "slurry"), ("solid", "tab:gray", "solid")]
 
     def draw(ax, rows, title):
         bottoms = np.zeros(3)
@@ -116,34 +87,23 @@ def plot_selected_summary(cold_at_selected, cool_reports, hot_rows, presets,
             bottoms += vals
         for i, r in enumerate(rows):
             tot = r["liquid"] + r["slurry"] + r["solid"]
-            Ta = ((r["liquid"] * r["liquid_T"] + r["slurry"] * r["slurry_T"]
-                   + r["solid"] * r["solid_T"]) / tot if tot > 0 else 0)
-            ax.text(i, bottoms[i] * 1.02 if bottoms[i] > 0 else 0.02 * max(1, bottoms.max()),
-                    f"{Ta:.0f}C", ha="center", fontsize=8)
+            Ta = ((r["liquid"] * r["liquid_T"] + r["slurry"] * r["slurry_T"] + r["solid"] * r["solid_T"]) / tot if tot > 0 else 0)
+            ax.text(i, bottoms[i] * 1.02 if bottoms[i] > 0 else 0.02 * max(1, bottoms.max()), f"{Ta:.0f}C", ha="center", fontsize=8)
         ax.set_xticks(x); ax.set_xticklabels(labels); ax.set_ylabel("Mass (kg)")
         ax.set_title(title); ax.legend(fontsize=8); ax.grid(True, alpha=0.3, axis="y")
 
-    draw(axes[0], [cold_at_selected[p] for p, _ in presets],
-         f"Cold start — end of {t_window_hr:.1f} h heating")
-    draw(axes[1], [cool_reports[p] for p, _ in presets],
-         f"Residual — after {t_cooldown_hr:.1f} h no power")
-    draw(axes[2], hot_rows,
-         f"Hot run — end of {t_window_hr:.1f} h heating from residual")
+    draw(axes[0], [cold_at_selected[p] for p, _ in presets], f"Cold start — end of {t_window_hr:.1f} h heating")
+    draw(axes[1], [cool_reports[p] for p, _ in presets], f"Residual — after {t_cooldown_hr:.1f} h no power")
+    draw(axes[2], hot_rows, f"Hot run — end of {t_window_hr:.1f} h heating from residual")
     L_coil = 2.0 * np.pi * R_ag * n_ag
-    fig.suptitle(f"Selected coil: R={R_ag:.3f} m, n={n_ag} turns, L={L_coil:.1f} m",
-                 fontsize=11, fontweight="bold")
+    fig.suptitle(f"Selected coil: R={R_ag:.3f} m, n={n_ag} turns, L={L_coil:.1f} m", fontsize=11, fontweight="bold")
     fig.tight_layout(); fig.savefig(out_path, dpi=130)
 
-
-# ============================================================
-# PHASE A OUTPUT (written first)
-# ============================================================
 def build_menu(radii, geom, cold_rows):
     menu = []
     for ri, R in enumerate(radii, 1):
         for g in sorted([g for g in geom if g["R"] == R], key=lambda x: x["n"]):
-            menu.append({"idx": len(menu) + 1, "R_idx": ri, "R": g["R"], "n": g["n"],
-                         "L": g["L"], "R_ratio": g["R_ratio"]})
+            menu.append({"idx": len(menu) + 1, "R_idx": ri, "R": g["R"], "n": g["n"], "L": g["L"], "R_ratio": g["R_ratio"]})
     lookup = {}
     for r in cold_rows:
         key = (round(r["R"], 6), r["n"])
@@ -154,7 +114,6 @@ def build_menu(radii, geom, cold_rows):
         m["liq_mid"] = vals.get("mid", 0.0)
         m["liq_hot"] = vals.get("hot", 0.0)
     return menu
-
 
 def write_phase_a(outdir, cfg, cold_rows, geom, radii, presets):
     os.makedirs(outdir, exist_ok=True)
@@ -173,17 +132,12 @@ def write_phase_a(outdir, cfg, cold_rows, geom, radii, presets):
         f.write(CRLF.join(lines) + CRLF)
     return menu
 
-
-# ============================================================
-# FINAL REPORT
-# ============================================================
 def _html_table(rows):
     out = ["<table>"]
     for k, v in rows:
         out.append(f"<tr><td>{k}</td><td>{v}</td></tr>")
     out.append("</table>")
     return "\n".join(out)
-
 
 def _html_prop_arrays(name, T_arr, props):
     h = [f"<h3>{name} — properties at [{', '.join(f'{t:.1f}' for t in T_arr)}] degC</h3>",
@@ -195,15 +149,12 @@ def _html_prop_arrays(name, T_arr, props):
     h.append("</table>")
     return "\n".join(h)
 
-
 def _png_data_uri(path):
     with open(path, "rb") as f:
         return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
 
-
 def _T_band(r, cfg, mat, R_ag):
     return float(np.interp(np.array(r["H_final"])[coil_index(cfg, R_ag)], mat["H_grid"], mat["T_grid"]))
-
 
 def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected,
                       cool_reports, hot_rows, presets, pngs):
@@ -347,7 +298,6 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected,
         f.write("\n".join(h).replace("\n", CRLF))
     return path
 
-
 def final_report_text(cfg, R_ag, n_ag, cold_at_selected, cool_reports, hot_rows, presets):
     mat = cfg["_mat"]
     cp = coil_properties(cfg, R_ag, n_ag)
@@ -402,7 +352,6 @@ def final_report_text(cfg, R_ag, n_ag, cold_at_selected, cool_reports, hot_rows,
                  f"{chg:>+8.0f} {avg_T(r):>7.1f} {r['peak_power_kW']:>7.1f} "
                  f"{r['energy_kWh']:>8.1f}{flag}")
     return "\n".join(L)
-
 
 def write_final(outdir, cfg, R_ag, n_ag, cold_rows, cold_at_selected,
                 cool_reports, hot_rows, presets):
