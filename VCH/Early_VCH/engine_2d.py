@@ -172,8 +172,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 if mass[i, j] > 1e-6:
                     surf[i] = j
                     break
-                    
-        avg_surf = np.mean(surf)
 
         # 2. Coil Heating
         if is_heating:
@@ -228,80 +226,41 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     enthalpy[i, j] -= q * dt
 
         # ============================================================
-        # 4. Draining (Radial Suction Cone)
-        #    [FIX] Now scans the ENTIRE cone for fluid level, preventing
-        #    the drain from choking if the column directly above it empties.
+        # 4. Draining — pull ONLY from the drain cell (point source)
         # ============================================================
         drained_this_step = 0.0
         if is_heating:
-            R_suction_float = avg_surf * (dz / dr)
-            R_suction = max(1, int(R_suction_float))
-            i_min = max(0, drain_r - R_suction)
-            i_max = min(N_r - 1, drain_r + R_suction)
-
-            # Find the highest liquid level in the entire suction cone
-            surf_drain = -1
-            for i in range(i_min, i_max + 1):
+            if mass[drain_r, drain_z] > 1e-6 and T[drain_r, drain_z] > T_ms:
+                surf_drain = drain_z
                 for j in range(N_z - 1, drain_z - 1, -1):
-                    if mass[i, j] > 1e-6 and T[i, j] > T_me:
-                        if j > surf_drain:
-                            surf_drain = j
+                    if mass[drain_r, j] > 1e-6 and T[drain_r, j] > T_ms:
+                        surf_drain = j
                         break
-            
-            if surf_drain > drain_z:
-                h_head = (surf_drain - drain_z) * dz
-                rho_liq = np.interp(T_me, T_grid, rho_grid)
+                
+                h_head = max((surf_drain - drain_z) * dz, 0.01)
+                rho_liq = np.interp(T[drain_r, drain_z], T_grid, rho_grid)
                 v_flow = 0.6 * np.sqrt(2.0 * 9.81 * h_head)
                 target_mass = rho_liq * v_flow * drain_area * dt
                 
-                w_array = np.zeros(N_r)
-                j_array = np.zeros(N_r, dtype=np.int64)
-                total_weight = 0.0
+                actual_dm = min(target_mass, mass[drain_r, drain_z])
                 
-                for i in range(i_min, i_max + 1):
-                    best_j = -1
-                    for j in range(drain_z, N_z):
-                        if mass[i, j] > 1e-6 and T[i, j] > T_soft:
-                            best_j = j
-                            break
-                    
-                    if best_j != -1:
-                        dist = abs(i - drain_r) * dr
-                        max_dist = R_suction * dr
-                        w = 1.0 - (dist / max_dist) if max_dist > 0 else 1.0
-                        if w > 0.0:
-                            w_array[i] = w
-                            j_array[i] = best_j
-                            total_weight += w
-                            
-                if total_weight > 0.0:
-                    for i in range(i_min, i_max + 1):
-                        if w_array[i] > 0.0:
-                            dm = target_mass * (w_array[i] / total_weight)
-                            actual_dm = min(dm, mass[i, j_array[i]])
-                            
-                            if actual_dm > 0.0:
-                                fraction = actual_dm / max(1e-6, mass[i, j_array[i]])
-                                enthalpy[i, j_array[i]] *= (1.0 - fraction)
-                                mass[i, j_array[i]] -= actual_dm
-                                drained_mass_cum += actual_dm
-                                drained_this_step += actual_dm
-                                
-                                cycle_extracted_temp_sum[cycle_idx] += actual_dm * T[i, j_array[i]]
-                                
-                                if first_drain_time < 0:
-                                    first_drain_time = time_log[step]
-                                last_drain_time = time_log[step]
+                if actual_dm > 0.0:
+                    h_spec = enthalpy[drain_r, drain_z] / max(1e-6, mass[drain_r, drain_z])
+                    T_ext = T[drain_r, drain_z]
+                    mass[drain_r, drain_z] -= actual_dm
+                    enthalpy[drain_r, drain_z] -= actual_dm * h_spec
+                    drained_mass_cum += actual_dm
+                    drained_this_step += actual_dm
+                    cycle_extracted_temp_sum[cycle_idx] += actual_dm * T_ext
+                    if first_drain_time < 0:
+                        first_drain_time = time_log[step]
+                    last_drain_time = time_log[step]
 
-        # [DATA] Capture drain activity BEFORE makeup decrements it
         did_drain = drained_this_step > 0.0
-        
         if is_heating and not did_drain:
             idle_time += dt / 3600.0
 
-        # ============================================================
         # 5. Make-up Fluid
-        # ============================================================
         if has_makeup == 1 and drained_this_step > 0.0:
             h_makeup = np.interp(makeup_T, T_grid, H_grid)
             rho_fill = np.interp(makeup_T, T_grid, rho_grid)
@@ -318,7 +277,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             
         drain_log[step] = drained_mass_cum
 
-        # Refresh surface heights post-drain
+        # Refresh surfaces post-drain
         for i in range(N_r):
             surf[i] = 0
             for j in range(N_z - 1, -1, -1):
@@ -327,9 +286,10 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     break
 
         # ============================================================
-        # 6. Vertical Collapse (Viscosity & Pressure Head)
+        # 6. Vertical Fluid Flow (Gravity & Thermal Expansion)
         # ============================================================
         if has_makeup == 0:
+            # 6a. Downward Collapse (Gravity)
             for j in range(0, N_z - 1):
                 for i in range(N_r):
                     if mass[i, j+1] <= 1e-6:
@@ -355,76 +315,105 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i, j] += moved * h_spec
                         enthalpy[i, j+1] -= moved * h_spec
 
+            # 6b. Upward Expansion (Thermal Expansion)
+            # If a cell expands (density drops), its mass might exceed its fixed volume capacity.
+            # This excess mass is pushed upward.
+            for j in range(N_z - 2, -1, -1):
+                for i in range(N_r):
+                    if mass[i, j] <= 1e-6:
+                        continue
+                    rho_here = np.interp(T[i, j], T_grid, rho_grid)
+                    cap_mass = V_cell[i, j] * rho_here
+                    excess = mass[i, j] - cap_mass
+                    
+                    if excess > 1e-9:
+                        h_spec = enthalpy[i, j] / max(1e-6, mass[i, j])
+                        mass[i, j] -= excess
+                        mass[i, j+1] += excess
+                        enthalpy[i, j] -= excess * h_spec
+                        enthalpy[i, j+1] += excess * h_spec
+
         # ============================================================
-        # 7. Horizontal Surface Leveling (Bidirectional Cascade)
-        #    Includes capacity checks to prevent infinite mass pileup.
+        # 7. Radial Pressure-Driven Flow (cell-by-cell)
         # ============================================================
         if has_makeup == 0:
-            surf = np.zeros(N_r, dtype=np.int64)
+            # Effective fluid height per column, using ACTUAL local densities
+            eff_height = np.zeros(N_r)
             for i in range(N_r):
-                surf[i] = 0
-                for j in range(N_z - 1, -1, -1):
-                    if mass[i, j] > 1e-6:
-                        surf[i] = j
-                        break
-
-            # Forward pass
+                area_i = V_cell[i, 0] / dz
+                if area_i > 1e-9:
+                    vol_col = 0.0
+                    for j in range(N_z):
+                        if mass[i, j] > 1e-6:
+                            rho_here = np.interp(T[i, j], T_grid, rho_grid)
+                            vol_col += mass[i, j] / max(1e-6, rho_here)
+                    eff_height[i] = vol_col / area_i
+            
+            # Forward pass: flow from i to i+1
             for i in range(N_r - 1):
-                if surf[i] > surf[i+1]:
-                    j_top = surf[i]; j_target = surf[i+1]
-                    if T[i, j_top] > T_soft:
-                        rho_tgt = np.interp(T[i+1, j_target], T_grid, rho_grid)
-                        cap_mass = V_cell[i+1, j_target] * rho_tgt
-                        needed = cap_mass - mass[i+1, j_target]
-                        
-                        if needed > 1e-9:
-                            moved = min(mass[i, j_top] * 0.5, needed)
-                            h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
-                            mass[i, j_top] -= moved; mass[i+1, j_target] += moved
-                            enthalpy[i, j_top] -= moved * h_spec
-                            enthalpy[i+1, j_target] += moved * h_spec
-                elif surf[i+1] > surf[i]:
-                    j_top = surf[i+1]; j_target = surf[i]
-                    if T[i+1, j_top] > T_soft:
-                        rho_tgt = np.interp(T[i, j_target], T_grid, rho_grid)
-                        cap_mass = V_cell[i, j_target] * rho_tgt
-                        needed = cap_mass - mass[i, j_target]
-                        
-                        if needed > 1e-9:
-                            moved = min(mass[i+1, j_top] * 0.5, needed)
-                            h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
-                            mass[i+1, j_top] -= moved; mass[i, j_target] += moved
-                            enthalpy[i+1, j_top] -= moved * h_spec
-                            enthalpy[i, j_target] += moved * h_spec
-
-            # Backward pass
+                if eff_height[i] - eff_height[i+1] <= 1e-4:
+                    continue
+                for j in range(N_z):
+                    if mass[i, j] <= 1e-6:
+                        continue
+                    j_mid = (j + 0.5) * dz
+                    p_here = eff_height[i] - j_mid
+                    p_next = eff_height[i+1] - j_mid
+                    if p_here <= 0.0 or p_here <= p_next:
+                        continue
+                    local_dh = p_here - max(0.0, p_next)
+                    if local_dh <= 1e-6:
+                        continue
+                    
+                    rho_j = np.interp(T[i, j], T_grid, rho_grid)
+                    cap = V_cell[i+1, j] * rho_j
+                    needed = cap - mass[i+1, j]
+                    if needed <= 1e-9:
+                        continue
+                    
+                    mu_j = np.interp(T[i, j], T_grid, mu_grid)
+                    mobility = (K_settle * local_dh) / max(1e-6, mu_j)
+                    mobility = min(1.0, max(0.01, mobility))
+                    
+                    moved = min(mass[i, j] * mobility * 0.5, needed)
+                    if moved > 1e-9:
+                        h_spec = enthalpy[i, j] / max(1e-6, mass[i, j])
+                        mass[i, j] -= moved; mass[i+1, j] += moved
+                        enthalpy[i, j] -= moved * h_spec
+                        enthalpy[i+1, j] += moved * h_spec
+            
+            # Backward pass: flow from i+1 to i
             for i in range(N_r - 2, -1, -1):
-                if surf[i] > surf[i+1]:
-                    j_top = surf[i]; j_target = surf[i+1]
-                    if T[i, j_top] > T_soft:
-                        rho_tgt = np.interp(T[i+1, j_target], T_grid, rho_grid)
-                        cap_mass = V_cell[i+1, j_target] * rho_tgt
-                        needed = cap_mass - mass[i+1, j_target]
-                        
-                        if needed > 1e-9:
-                            moved = min(mass[i, j_top] * 0.5, needed)
-                            h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
-                            mass[i, j_top] -= moved; mass[i+1, j_target] += moved
-                            enthalpy[i, j_top] -= moved * h_spec
-                            enthalpy[i+1, j_target] += moved * h_spec
-                elif surf[i+1] > surf[i]:
-                    j_top = surf[i+1]; j_target = surf[i]
-                    if T[i+1, j_top] > T_soft:
-                        rho_tgt = np.interp(T[i, j_target], T_grid, rho_grid)
-                        cap_mass = V_cell[i, j_target] * rho_tgt
-                        needed = cap_mass - mass[i, j_target]
-                        
-                        if needed > 1e-9:
-                            moved = min(mass[i+1, j_top] * 0.5, needed)
-                            h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
-                            mass[i+1, j_top] -= moved; mass[i, j_target] += moved
-                            enthalpy[i+1, j_top] -= moved * h_spec
-                            enthalpy[i, j_target] += moved * h_spec
+                if eff_height[i+1] - eff_height[i] <= 1e-4:
+                    continue
+                for j in range(N_z):
+                    if mass[i+1, j] <= 1e-6:
+                        continue
+                    j_mid = (j + 0.5) * dz
+                    p_here = eff_height[i+1] - j_mid
+                    p_prev = eff_height[i] - j_mid
+                    if p_here <= 0.0 or p_here <= p_prev:
+                        continue
+                    local_dh = p_here - max(0.0, p_prev)
+                    if local_dh <= 1e-6:
+                        continue
+                    
+                    rho_j = np.interp(T[i+1, j], T_grid, rho_grid)
+                    cap = V_cell[i, j] * rho_j
+                    needed = cap - mass[i, j]
+                    if needed <= 1e-9:
+                        continue
+                    
+                    mu_j = np.interp(T[i+1, j], T_grid, mu_grid)
+                    mobility = (K_settle * local_dh) / max(1e-6, mu_j)
+                    mobility = min(1.0, max(0.01, mobility))
+                    
+                    moved = min(mass[i+1, j] * mobility * 0.5, needed)
+                    if moved > 1e-9:
+                        h_spec = enthalpy[i+1, j] / max(1e-6, mass[i+1, j])
+                        mass[i+1, j] -= moved; mass[i, j] += moved
+                        enthalpy[i+1, j] -= moved * h_spec
+                        enthalpy[i, j] += moved * h_spec
 
         # 8. Wall Heat Loss
         for j in range(N_z):
