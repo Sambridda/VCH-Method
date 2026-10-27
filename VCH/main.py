@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg") # Force non-GUI backend for all threads
+matplotlib.use("Agg")
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal, QThread
@@ -45,7 +45,7 @@ class MaterialWorker(QThread):
 
 class LandingPage(QtWidgets.QWidget):
     go_to_sim = Signal()
-    mats_updated = Signal()
+    show_graphs = Signal()
     
     def __init__(self):
         super().__init__()
@@ -82,31 +82,73 @@ class LandingPage(QtWidgets.QWidget):
 
     def _mat_done(self, success, error_msg):
         if success:
-            self.status.setText("Materials updated and graphs saved to out/materials/")
-            self.mats_updated.emit()
+            self.status.setText("Materials updated! Opening graphs...")
+            self.show_graphs.emit()
         else:
             self.status.setText("Error processing materials.")
             QtWidgets.QMessageBox.critical(self, "Processing Error", error_msg)
+
+class MaterialGraphsPage(QtWidgets.QWidget):
+    back_to_menu = Signal()
+    
+    def __init__(self):
+        super().__init__()
+        lay = QtWidgets.QVBoxLayout(self)
+        
+        head = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Material Property Curves")
+        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #1a4d7a;")
+        btn_back = QtWidgets.QPushButton("\u25C0 Back to Menu")
+        btn_back.clicked.connect(self.back_to_menu.emit)
+        head.addWidget(title); head.addStretch(); head.addWidget(btn_back)
+        lay.addLayout(head)
+        
+        scroll = QtWidgets.QScrollArea(); scroll.setWidgetResizable(True)
+        self.container = QtWidgets.QWidget()
+        self.grid = QtWidgets.QGridLayout(self.container)
+        scroll.setWidget(self.container)
+        lay.addWidget(scroll)
+
+    def load_graphs(self):
+        while self.grid.count():
+            w = self.grid.takeAt(0).widget()
+            if w: w.deleteLater()
+            
+        if not os.path.exists(materials.MAT_DIR): return
+            
+        images = sorted([f for f in os.listdir(materials.MAT_DIR) if f.endswith('.png')])
+        row, col = 0, 0
+        for img_name in images:
+            lbl = QtWidgets.QLabel()
+            pix = QtGui.QPixmap(os.path.join(materials.MAT_DIR, img_name))
+            lbl.setPixmap(pix.scaled(600, 400, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            frame = QtWidgets.QGroupBox(img_name.replace('.png', '').replace('_', ' ').title())
+            flay = QtWidgets.QVBoxLayout(frame); flay.addWidget(lbl)
+            
+            self.grid.addWidget(frame, row, col)
+            col += 1
+            if col > 1: col = 0; row += 1
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VCH Framework")
         self.resize(1180, 820)
-        self.cfg = None
-        self.study = None
-        self.outdir = None
-        self.worker = None
-        self.menu = []
-        self.form = None
+        self.cfg = None; self.study = None; self.outdir = None; self.worker = None; self.menu = []; self.form = None
 
         self.stack = QtWidgets.QStackedWidget()
         self.setCentralWidget(self.stack)
 
         self.landing = LandingPage()
         self.landing.go_to_sim.connect(self.show_inputs)
-        self.landing.mats_updated.connect(self.rebuild_form)
+        self.landing.show_graphs.connect(self.show_material_graphs)
         self.stack.addWidget(self.landing)
+
+        self.mat_graphs = MaterialGraphsPage()
+        self.mat_graphs.back_to_menu.connect(lambda: self.stack.setCurrentWidget(self.landing))
+        self.stack.addWidget(self.mat_graphs)
 
         self.page_a = self._build_progress_page("Phase A: cold sweep")
         self.stack.addWidget(self.page_a)
@@ -122,11 +164,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.results_page.addWidget(self.results_box)
         self.stack.addWidget(self.results_page)
 
-        # Build the form initially in case cache was loaded on startup
         self.rebuild_form()
-
         self.statusBar().showMessage("Ready.")
         self.showMaximized()
+
+    def show_material_graphs(self):
+        self.mat_graphs.load_graphs()
+        self.stack.setCurrentWidget(self.mat_graphs)
+        # We also need to rebuild the form so the new dropdowns pick up the freshly generated materials
+        self.rebuild_form()
 
     def rebuild_form(self):
         if self.form is not None:

@@ -2,6 +2,7 @@
 Generates graphs, caches the data for the engine, and checks for updates."""
 import os
 import json
+import shutil
 import numpy as np
 import openpyxl
 from scipy.interpolate import PchipInterpolator
@@ -29,7 +30,6 @@ def _densify(x, y, num_points=1000):
     return x_dense, spline(x_dense)
 
 def _plot_and_save(name, t, data_cols, labels, ylabel, color, is_fluid=True):
-    os.makedirs(MAT_DIR, exist_ok=True)
     fig = Figure(figsize=(8, 5))
     ax1 = fig.add_subplot(111)
     
@@ -64,8 +64,13 @@ def process_materials(force=False):
             _load_from_cache()
             return True
 
-    # FIX: IMPELLERS must be initialized as a list [], not a dict {}
+    # FIX: IMPELLERS must be a list []
     FLUIDS, METALS, INSULATION, IMPELLERS = {}, {}, {}, []
+
+    # Clear old graphs to ensure we only show the new ones
+    if os.path.exists(MAT_DIR):
+        shutil.rmtree(MAT_DIR)
+    os.makedirs(MAT_DIR, exist_ok=True)
 
     wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
     
@@ -91,7 +96,6 @@ def process_materials(force=False):
         
         for name, data in raw_data.items():
             arr = np.array(sorted(data, key=lambda x: x[0]))
-            # Deduplicate X values to prevent PCHIP crash
             _, idx = np.unique(arr[:, 0], return_index=True)
             arr = arr[idx]
             t_raw = arr[:, 0]
@@ -158,7 +162,6 @@ def process_materials(force=False):
                 except (ValueError, TypeError): pass
 
     # --- SAVE CACHE ---
-    os.makedirs(OUT_DIR, exist_ok=True)
     cache_data = dict(FLUIDS=FLUIDS, METALS=METALS, INSULATION=INSULATION, IMPELLERS=IMPELLERS)
     with open(CACHE_FILE, "w") as f:
         json.dump(cache_data, f)
