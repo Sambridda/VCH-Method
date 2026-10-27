@@ -4,3 +4,4 @@ PySide6
 matplotlib
 psutil
 openpyxl
+scipy

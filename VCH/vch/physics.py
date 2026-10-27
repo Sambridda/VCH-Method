@@ -20,7 +20,7 @@ def build_material_tables(cfg):
 
     T_min = min(T_amb_low, T_ms) - 20.0
     T_max = max(T_water_in, T_me) + 20.0
-    n_g = 400
+    n_g = 1000 # Upgraded from 400 to 1000 to match PCHIP resolution
     T_grid = np.linspace(T_min, T_max, n_g)
 
     Ts, Tl = cfg["T_solid_arr"], cfg["T_liquid_arr"]
