@@ -2,7 +2,6 @@
 Generates graphs, caches the data for the engine, and checks for updates."""
 import os
 import json
-import shutil
 import numpy as np
 import openpyxl
 from scipy.interpolate import PchipInterpolator
@@ -22,6 +21,7 @@ FLUIDS = {}
 METALS = {}
 INSULATION = {}
 IMPELLERS = []
+MELT_PROPS = {}  
 
 def _densify(x, y, num_points=1000):
     if len(x) < 3: return x, y
@@ -30,6 +30,7 @@ def _densify(x, y, num_points=1000):
     return x_dense, spline(x_dense)
 
 def _plot_and_save(name, t, data_cols, labels, ylabel, color, is_fluid=True):
+    os.makedirs(MAT_DIR, exist_ok=True)
     fig = Figure(figsize=(8, 5))
     ax1 = fig.add_subplot(111)
     
@@ -52,7 +53,8 @@ def _plot_and_save(name, t, data_cols, labels, ylabel, color, is_fluid=True):
     plt.close(fig)
 
 def process_materials(force=False):
-    global FLUIDS, METALS, INSULATION, IMPELLERS
+    # CRITICAL FIX: Added MELT_PROPS to the global statement
+    global FLUIDS, METALS, INSULATION, IMPELLERS, MELT_PROPS
     
     if not os.path.exists(EXCEL_PATH):
         raise FileNotFoundError(f"Excel file not found at {EXCEL_PATH}")
@@ -64,13 +66,7 @@ def process_materials(force=False):
             _load_from_cache()
             return True
 
-    # FIX: IMPELLERS must be a list []
-    FLUIDS, METALS, INSULATION, IMPELLERS = {}, {}, {}, []
-
-    # Clear old graphs to ensure we only show the new ones
-    if os.path.exists(MAT_DIR):
-        shutil.rmtree(MAT_DIR)
-    os.makedirs(MAT_DIR, exist_ok=True)
+    FLUIDS, METALS, INSULATION, IMPELLERS, MELT_PROPS = {}, {}, {}, [], {}
 
     wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
     
@@ -91,8 +87,10 @@ def process_materials(force=False):
                 mu = float(row[5]) if isinstance(row[5], (int, float)) else 1.0
                 k = float(row[6]) if isinstance(row[6], (int, float)) else 0.5
                 
+                latent = float(row[7]) if len(row) > 7 and isinstance(row[7], (int, float)) else 0.0
+                
                 if current_name not in raw_data: raw_data[current_name] = []
-                raw_data[current_name].append((t, rho, cp, mu, k))
+                raw_data[current_name].append((t, rho, cp, mu, k, latent))
         
         for name, data in raw_data.items():
             arr = np.array(sorted(data, key=lambda x: x[0]))
@@ -101,6 +99,21 @@ def process_materials(force=False):
             t_raw = arr[:, 0]
             
             if len(t_raw) < 3: continue
+            
+            latent_arr = arr[:, 5]
+            if np.any(latent_arr > 0):
+                # NEW LOGIC: Find the peak latent heat to identify the bulk melting region
+                peak_latent = np.max(latent_arr)
+                
+                # Define Melt-Start as the temperature where latent heat reaches 50% of the peak
+                melt_mask = latent_arr >= (0.5 * peak_latent)
+                
+                T_ms_calc = float(arr[melt_mask, 0].min()) 
+                T_me_calc = float(arr[melt_mask, 0].max()) 
+                
+                # Total latent heat is still the sum of all non-zero values
+                Hfus_calc = float(latent_arr[latent_arr > 0].sum() * 1000.0)
+                MELT_PROPS[name] = (T_ms_calc, T_me_calc, Hfus_calc)
                 
             t_dense, rho_d = _densify(t_raw, arr[:, 1])
             _, cp_d = _densify(t_raw, arr[:, 2])
@@ -162,14 +175,15 @@ def process_materials(force=False):
                 except (ValueError, TypeError): pass
 
     # --- SAVE CACHE ---
-    cache_data = dict(FLUIDS=FLUIDS, METALS=METALS, INSULATION=INSULATION, IMPELLERS=IMPELLERS)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    cache_data = dict(FLUIDS=FLUIDS, METALS=METALS, INSULATION=INSULATION, IMPELLERS=IMPELLERS, MELT_PROPS=MELT_PROPS)    
     with open(CACHE_FILE, "w") as f:
         json.dump(cache_data, f)
         
     return True
 
 def _load_from_cache():
-    global FLUIDS, METALS, INSULATION, IMPELLERS
+    global FLUIDS, METALS, INSULATION, IMPELLERS, MELT_PROPS
     if not os.path.exists(CACHE_FILE): return
     with open(CACHE_FILE, "r") as f:
         data = json.load(f)
@@ -178,6 +192,7 @@ def _load_from_cache():
     METALS = {k: np.array(v) for k, v in data.get("METALS", {}).items()}
     INSULATION = data.get("INSULATION", {})
     IMPELLERS = data.get("IMPELLERS", [])
+    MELT_PROPS = data.get("MELT_PROPS", {})
 
 if os.path.exists(CACHE_FILE):
     _load_from_cache()

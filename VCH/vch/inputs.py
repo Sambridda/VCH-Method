@@ -3,6 +3,7 @@ import json
 import numpy as np
 from .geometry import max_turns
 from . import materials
+import traceback
 
 ENV_PRESETS = [("Indoor  (h_air = 5 W/m2K)", 5.0),
                ("Outdoor  (h_air = 10 W/m2K)", 10.0),
@@ -15,9 +16,7 @@ SCALAR_DEFAULTS = dict(
     T_water_in=70.0, flow_m3h=1.17, beta_liq=7e-4, dT_natural=5.0,
     has_agitator=False, ag_type=1, N_rpm=60.0, D_imp=0.0, visc_corr=1.0,
     fluid_name=list(materials.FLUIDS.keys())[0] if materials.FLUIDS else "Water", 
-    T_water_low=2.0,
     tank_name=list(materials.FLUIDS.keys())[-1] if materials.FLUIDS else "RBD Palm Oil", 
-    T_ms=31.0, T_me=41.0, Hfus=65000.0,
     wall_name=list(materials.METALS.keys())[0] if materials.METALS else "Stainless Steel", 
     t_wall=0.005,
     coil_mat=list(materials.METALS.keys())[0] if materials.METALS else "Stainless Steel", 
@@ -31,15 +30,22 @@ def build_cfg(inp):
     errors, warnings = [], []
     g = inp
     
-    # --- BUG FIX: Prevent Numba crash if database is empty ---
     if not materials.FLUIDS: return None, ["No fluids loaded. Please process materials first."], []
     if not materials.METALS: return None, ["No metals loaded. Please process materials first."], []
 
     if g["T_water_in"] <= g["T_amb_low"]: errors.append("Coil inlet temperature must be above low ambient.")
-    if g["T_ms"] >= g["T_me"]: errors.append("Melt-start must be below melt-end.")
-    if g["T_amb_low"] >= g["T_ms"]: errors.append("Low ambient must be below melt-start.")
-    if g["T_me"] >= g["T_water_in"]: errors.append("Melt-end must be below coil inlet.")
     if not (20 <= g["N"] <= 500): errors.append("Radial nodes N must be between 20 and 500.")
+    
+    # --- Pull the auto-calculated values from materials.py ---
+    if g["tank_name"] not in materials.MELT_PROPS:
+        return None, [f"Could not find melting data for '{g['tank_name']}'.\n\nYou MUST select a material that has a melting point (like RBD Palm Oil), not Water."], []
+    
+    T_ms_calc, T_me_calc, Hfus_calc = materials.MELT_PROPS[g["tank_name"]]
+
+    if T_ms_calc >= T_me_calc: errors.append("Melt-start must be below melt-end.")
+    # REMOVED: Low ambient restriction is gone
+    if T_me_calc >= g["T_water_in"]: errors.append("Melt-end must be below coil inlet.")
+
     if errors: return None, errors, warnings
 
     D_imp = g["D_imp"] if g["D_imp"] > 0 else g["r_inner"]
@@ -47,33 +53,40 @@ def build_cfg(inp):
     ag_C, ag_a = (materials.IMPELLERS[ag_idx]["C"], materials.IMPELLERS[ag_idx]["a"]) if 0 <= ag_idx < len(materials.IMPELLERS) else (0.54, 0.67)
     h_air = ENV_PRESETS[int(g["env_index"])][1]
 
-    fluid_data = materials.FLUIDS.get(g["fluid_name"])
-    tank_data = materials.FLUIDS.get(g["tank_name"])
-    if fluid_data is None: return None, [f"Coil fluid '{g['fluid_name']}' not found."], []
-    if tank_data is None: return None, [f"Tank fluid '{g['tank_name']}' not found."], []
+    # --- CRITICAL FIX: Convert lists to numpy arrays so [:, 0] slicing works ---
+    fluid_data = np.array(materials.FLUIDS.get(g["fluid_name"]))
+    tank_data = np.array(materials.FLUIDS.get(g["tank_name"]))
+    wall_data = np.array(materials.METALS.get(g["wall_name"]))
+    coil_data = np.array(materials.METALS.get(g["coil_mat"]))
     
-    solid_mask = tank_data[:, 0] <= g["T_ms"]
-    liquid_mask = tank_data[:, 0] >= g["T_me"]
+    if len(fluid_data) == 0: return None, [f"Coil fluid '{g['fluid_name']}' not found."], []
+    if len(tank_data) == 0: return None, [f"Tank fluid '{g['tank_name']}' not found."], []
+    
+    solid_mask = tank_data[:, 0] <= T_ms_calc
+    liquid_mask = tank_data[:, 0] >= T_me_calc
+    
+    if not np.any(solid_mask): return None, [f"Tank fluid '{g['tank_name']}' has no solid phase data below melt-start ({T_ms_calc}°C). Check Excel file."], []
+    if not np.any(liquid_mask): return None, [f"Tank fluid '{g['tank_name']}' has no liquid phase data above melt-end ({T_me_calc}°C). Check Excel file."], []
     
     cfg = dict(
         fluid_name=g["fluid_name"],
         T_water_arr=fluid_data[:, 0], rho_water_arr=fluid_data[:, 1],
         cp_water_arr=fluid_data[:, 2], mu_water_arr=fluid_data[:, 3], k_water_arr=fluid_data[:, 4],
-        T_water_low=g["T_water_low"],
         
-        tank_name=g["tank_name"], T_ms=g["T_ms"], T_me=g["T_me"], Hfus=g["Hfus"],
+        tank_name=g["tank_name"], T_ms=T_ms_calc, T_me=T_me_calc, Hfus=Hfus_calc,
+        
         T_solid_arr=tank_data[solid_mask, 0], rho_solid_arr=tank_data[solid_mask, 1],
         cp_solid_arr=tank_data[solid_mask, 2], k_solid_arr=tank_data[solid_mask, 4], mu_solid_arr=tank_data[solid_mask, 3],
         T_liquid_arr=tank_data[liquid_mask, 0], rho_liquid_arr=tank_data[liquid_mask, 1],
         cp_liquid_arr=tank_data[liquid_mask, 2], k_liquid_arr=tank_data[liquid_mask, 4], mu_liquid_arr=tank_data[liquid_mask, 3],
         
         wall_name=g["wall_name"], t_wall=g["t_wall"],
-        T_wall_arr=materials.METALS[g["wall_name"]][:, 0], rho_wall_arr=materials.METALS[g["wall_name"]][:, 1],
-        cp_wall_arr=materials.METALS[g["wall_name"]][:, 2], k_wall_arr=materials.METALS[g["wall_name"]][:, 3],
+        T_wall_arr=wall_data[:, 0], rho_wall_arr=wall_data[:, 1],
+        cp_wall_arr=wall_data[:, 2], k_wall_arr=wall_data[:, 3],
         
         coil_mat=g["coil_mat"], d_in=g["d_in"], d_out=g["d_out"], R_f_out=g["R_f_out"],
-        T_tube_arr=materials.METALS[g["coil_mat"]][:, 0], rho_tube_arr=materials.METALS[g["coil_mat"]][:, 1],
-        cp_tube_arr=materials.METALS[g["coil_mat"]][:, 2], k_tube_arr=materials.METALS[g["coil_mat"]][:, 3],
+        T_tube_arr=coil_data[:, 0], rho_tube_arr=coil_data[:, 1],
+        cp_tube_arr=coil_data[:, 2], k_tube_arr=coil_data[:, 3],
         
         h_air=h_air, t_ins=g["t_ins"], k_ins=g["k_ins"],
         r_inner=g["r_inner"], L_avail=g["L_avail"],
@@ -181,10 +194,15 @@ class InputsForm(QtWidgets.QWidget):
         self._num(f, "T_amb_mid", "Mid ambient", d["T_amb_mid"], "degC")
         self._num(f, "T_amb_hot", "Hot ambient", d["T_amb_hot"], "degC")
         lay.addWidget(self._group("Ambient Temperatures", f))
+        
         f = QtWidgets.QFormLayout()
         self._num(f, "T_water_in", "Coil inlet temperature", d["T_water_in"], "degC")
         self._num(f, "flow_m3h", "Coil volumetric flow", d["flow_m3h"], "m3/h")
+        # ADDED BACK: These are required for the natural convection physics equations
+        self._num(f, "beta_liq", "Thermal expansion coeff (beta)", d["beta_liq"], "1/K")
+        self._num(f, "dT_natural", "Driving delta-T", d["dT_natural"], "K")
         lay.addWidget(self._group("Operating Conditions", f))
+        
         f = QtWidgets.QFormLayout()
         self.cb_env = QtWidgets.QComboBox()
         for label, _h in ENV_PRESETS: self.cb_env.addItem(label)
@@ -203,7 +221,10 @@ class InputsForm(QtWidgets.QWidget):
         lay.addWidget(self.cb_agitator)
         f = QtWidgets.QFormLayout()
         self.cb_ag_type = QtWidgets.QComboBox()
-        for k, label in AGITATORS: self.cb_ag_type.addItem(label, k)
+        if not AGITATORS:
+            self.cb_ag_type.addItem("Default", 1)
+        else:
+            for k, label in AGITATORS: self.cb_ag_type.addItem(label, k)
         self.fields["ag_type"] = self.cb_ag_type
         f.addRow("Impeller type", self.cb_ag_type)
         self._num(f, "N_rpm", "Rotational speed", d["N_rpm"], "RPM")
@@ -217,18 +238,15 @@ class InputsForm(QtWidgets.QWidget):
         
         f = QtWidgets.QFormLayout()
         self._combo(f, "fluid_name", "Coil Fluid", list(materials.FLUIDS.keys()), d["fluid_name"])
-        self._num(f, "T_water_low", "Lowest expected coil-fluid temp", d["T_water_low"], "degC")
         lay.addWidget(self._group("Coil Fluid (Heating Side)", f))
         
         f = QtWidgets.QFormLayout()
         self._combo(f, "tank_name", "Tank Fluid", list(materials.FLUIDS.keys()), d["tank_name"])
-        self._num(f, "T_ms", "Melt-start temperature", d["T_ms"], "degC")
-        self._num(f, "T_me", "Melt-end temperature", d["T_me"], "degC")
-        self._num(f, "Hfus", "Latent heat of fusion", d["Hfus"], "J/kg")
         lay.addWidget(self._group("Tank Fluid (Phase Change Side)", f))
         
         note = QtWidgets.QLabel("Material properties are automatically loaded from the VCH Framework.xlsx database "
-                                "and smoothed using PCHIP curve fitting. No manual property entry is required.")
+                                "and smoothed using PCHIP curve fitting. Melt temperatures and latent heat are extracted automatically.\n"
+                                "No manual property entry is required.")
         note.setWordWrap(True); note.setStyleSheet("color:#666; margin-top: 15px; font-style: italic;")
         lay.addWidget(note)
         lay.addStretch(); return w
@@ -283,7 +301,9 @@ class InputsForm(QtWidgets.QWidget):
                 try: inp[key] = w.value()
                 except ValueError: errors.append(f"'{self.labels[key]}' is invalid.")
             elif isinstance(w, QtWidgets.QCheckBox): inp[key] = w.isChecked()
-            elif key == "ag_type": inp[key] = int(w.currentData())
+            elif key == "ag_type": 
+                data = w.currentData()
+                inp[key] = int(data) if data is not None else 1
             elif isinstance(w, QtWidgets.QComboBox): inp[key] = int(w.currentIndex()) if key == "env_index" else w.currentText()
             else: inp[key] = w.text().strip()
         return inp, errors
@@ -301,14 +321,28 @@ class InputsForm(QtWidgets.QWidget):
             else: w.setText(str(v))
 
     def review(self):
-        inp, errors = self.get_inputs()
-        cfg, warnings = None, []
-        if not errors: cfg, errors, warnings = build_cfg(inp)
-        if errors:
-            QtWidgets.QMessageBox.warning(self, "Check inputs", "\n".join(errors))
-            return
-        self.confirmed.emit(cfg, inp)
+        try:
+            inp, errors = self.get_inputs()
+            cfg, warnings = None, []
+            if not errors: 
+                cfg, errors, warnings = build_cfg(inp)
+            
+            if errors:
+                err_msg = "\n\n".join(errors)
+                print("INPUT ERRORS DETECTED:\n", err_msg)
+                QtWidgets.QMessageBox.critical(self, "Cannot Start Simulation", err_msg)
+                return
+                
+            if cfg is None:
+                QtWidgets.QMessageBox.critical(self, "Cannot Start Simulation", "Unknown error building configuration.")
+                return
 
+            self.confirmed.emit(cfg, inp)
+        except Exception as e:
+            err_trace = traceback.format_exc()
+            print("PYTHON CRASH:\n", err_trace)
+            QtWidgets.QMessageBox.critical(self, "Python Crash", f"An error occurred before starting:\n\n{str(e)}\n\nSee terminal for details.")
+    
     def save_dialog(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save", "inputs.json", "JSON (*.json)")
         if path:
