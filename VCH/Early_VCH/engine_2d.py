@@ -225,9 +225,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     q = k_avg * area * (T[i, j] - T[i, j+1]) / dz
                     enthalpy[i, j] -= q * dt
 
-        # ============================================================
         # 4. Draining — pull ONLY from the drain cell (point source)
-        # ============================================================
         drained_this_step = 0.0
         if is_heating:
             if mass[drain_r, drain_z] > 1e-6 and T[drain_r, drain_z] > T_ms:
@@ -285,9 +283,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     surf[i] = j
                     break
 
-        # ============================================================
         # 6. Vertical Fluid Flow (Gravity & Thermal Expansion)
-        # ============================================================
         if has_makeup == 0:
             # 6a. Downward Collapse (Gravity)
             for j in range(0, N_z - 1):
@@ -316,8 +312,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i, j+1] -= moved * h_spec
 
             # 6b. Upward Expansion (Thermal Expansion)
-            # If a cell expands (density drops), its mass might exceed its fixed volume capacity.
-            # This excess mass is pushed upward.
             for j in range(N_z - 2, -1, -1):
                 for i in range(N_r):
                     if mass[i, j] <= 1e-6:
@@ -333,11 +327,8 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i, j] -= excess * h_spec
                         enthalpy[i, j+1] += excess * h_spec
 
-        # ============================================================
         # 7. Radial Pressure-Driven Flow (cell-by-cell)
-        # ============================================================
         if has_makeup == 0:
-            # Effective fluid height per column, using ACTUAL local densities
             eff_height = np.zeros(N_r)
             for i in range(N_r):
                 area_i = V_cell[i, 0] / dz
@@ -349,7 +340,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                             vol_col += mass[i, j] / max(1e-6, rho_here)
                     eff_height[i] = vol_col / area_i
             
-            # Forward pass: flow from i to i+1
             for i in range(N_r - 1):
                 if eff_height[i] - eff_height[i+1] <= 1e-4:
                     continue
@@ -382,7 +372,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i, j] -= moved * h_spec
                         enthalpy[i+1, j] += moved * h_spec
             
-            # Backward pass: flow from i+1 to i
             for i in range(N_r - 2, -1, -1):
                 if eff_height[i+1] - eff_height[i] <= 1e-4:
                     continue
@@ -422,7 +411,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 q_loss = U_tank_air * area * (T[N_r-1, j] - T_amb)
                 enthalpy[N_r-1, j] -= q_loss * dt
 
-        # [DATA] Record per-step status
         if not is_heating:
             status_log[step] = -1
         elif did_drain:
@@ -430,7 +418,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         else:
             status_log[step] = 0
 
-        # --- End of Heating Phase Snapshot & Cycle Metrics ---
         if is_heating and (step_in_cycle == n_steps_heat - 1):
             for i in range(N_r):
                 for j in range(N_z):
@@ -603,22 +590,18 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     curve_path = os.path.join(outdir, f"b1_drain_curve.png")
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(time_log, drain_log, linewidth=2, color="tab:blue", label="Extracted Liquid")
-    
     for step in range(len(time_log)):
         if not is_heating_log[step]:
             ax.axvspan(time_log[step], time_log[step] + cfg["dt_sec"]/3600.0, color='grey', alpha=0.2, lw=0)
-    
     for step in range(len(time_log) - 1):
         if is_heating_log[step] and abs(drain_log[step+1] - drain_log[step]) < 1e-6:
             ax.axvspan(time_log[step], time_log[step+1], color='red', alpha=0.15, lw=0)
-    
     legend_elements = [
         plt.Line2D([0], [0], color='tab:blue', lw=2, label='Extracted Liquid'),
         Patch(facecolor='grey', alpha=0.2, label='Cooling Phase (Coil OFF)'),
         Patch(facecolor='red', alpha=0.15, label='Idle (Solid/Empty)')
     ]
     ax.legend(handles=legend_elements, loc="upper left")
-    
     ax.set_xlabel("Time (hours)")
     ax.set_ylabel("Cumulative Liquid Extracted (kg)")
     ax.set_title(f"Extraction Curve ({n_cycles} Cycles, Valve D={drain_diameter*1000:.1f} mm)")
@@ -627,6 +610,8 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
 
     heatmap_paths = []
     massmap_paths = []
+    topmass_paths = []
+    toptemp_paths = []
     phase_bar_paths = []
     
     for c in range(n_cycles):
@@ -637,67 +622,81 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         r_wall_end = cfg["r_inner"] + cfg["t_wall"]
         r_ins_end = r_wall_end + cfg["t_ins"]
         
+        # --- Heatmap (Lateral) ---
         h_path = os.path.join(outdir, f"b1_heatmap_cyc{c+1}.png")
         fig, ax = plt.subplots(figsize=(10, 8))
-        cmap = plt.cm.inferno.copy()
-        cmap.set_bad('white') 
+        cmap = plt.cm.inferno.copy(); cmap.set_bad('white') 
         c_mesh = ax.pcolormesh(r_grid, z_grid, T_snapshots[c].T, cmap=cmap, shading='auto')
-        
         ax.axvspan(r_wall_start, r_wall_end, color='dimgrey', alpha=0.8, lw=0)
         if cfg["t_ins"] > 0:
             ax.axvspan(r_wall_end, r_ins_end, color='lightgrey', alpha=0.8, lw=0, hatch='//')
-            ax.text(r_wall_end + cfg["t_ins"]/2, tank_height/2, "Insul.", ha='center', va='center', fontsize=10, rotation=90)
-            
         fig.colorbar(c_mesh, ax=ax, label='Temperature (°C)')
-        ax.set_xlabel("Radius (m)")
-        ax.set_ylabel("Height (m)")
-        ax.set_title(f"Cycle {c+1} — Temp")
-        ax.set_xlim(0, r_ins_end)
-        
-        ax.axhline(cfg["coil_clearance_bottom"], color='cyan', linestyle='--', linewidth=1)
-        ax.axhline(cfg["coil_clearance_bottom"] + cfg["L_avail"], color='cyan', linestyle='--', linewidth=1)
-        
+        ax.set_title(f"Cycle {c+1} — Lateral Temp"); ax.set_xlim(0, r_ins_end)
         fig.savefig(h_path, dpi=130); plt.close(fig)
         heatmap_paths.append(h_path)
 
+        # --- Mass Map (Lateral) ---
         m_path = os.path.join(outdir, f"b1_massmap_cyc{c+1}.png")
         fig, ax = plt.subplots(figsize=(10, 8))
-        cmap_m = plt.cm.Blues.copy()
-        cmap_m.set_bad('white')
+        cmap_m = plt.cm.Blues.copy(); cmap_m.set_bad('white')
         m_mesh = ax.pcolormesh(r_grid, z_grid, M_snapshots[c].T, cmap=cmap_m, shading='auto')
-        
         ax.axvspan(r_wall_start, r_wall_end, color='dimgrey', alpha=0.8, lw=0)
-        if cfg["t_ins"] > 0:
-            ax.axvspan(r_wall_end, r_ins_end, color='lightgrey', alpha=0.8, lw=0, hatch='//')
-            ax.text(r_wall_end + cfg["t_ins"]/2, tank_height/2, "Insul.", ha='center', va='center', fontsize=10, rotation=90)
-            
         fig.colorbar(m_mesh, ax=ax, label='Mass (kg)')
-        ax.set_xlabel("Radius (m)")
-        ax.set_ylabel("Height (m)")
-        ax.set_title(f"Cycle {c+1} — Mass")
-        ax.set_xlim(0, r_ins_end)
-        
-        ax.axhline(cfg["coil_clearance_bottom"], color='red', linestyle='--', linewidth=1)
-        ax.axhline(cfg["coil_clearance_bottom"] + cfg["L_avail"], color='red', linestyle='--', linewidth=1)
-        
+        ax.set_title(f"Cycle {c+1} — Lateral Mass"); ax.set_xlim(0, r_ins_end)
         fig.savefig(m_path, dpi=130); plt.close(fig)
         massmap_paths.append(m_path)
 
+        # ==========================================
+        # --- TOP-DOWN POLAR PLOTS ---
+        # ==========================================
+        theta = np.linspace(0, 2*np.pi, 100)
+        R_mesh, Theta_mesh = np.meshgrid(r_grid, theta)
+        
+        # 1. Top-Down Column Mass (Sum of mass in each vertical slice)
+        col_mass = np.sum(M_snapshots[c], axis=1) # shape (N_r,)
+        M_mesh = np.tile(col_mass, (len(theta), 1))
+        
+        tm_path = os.path.join(outdir, f"b1_topmass_cyc{c+1}.png")
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'})
+        p_mesh = ax.pcolormesh(Theta_mesh, R_mesh, M_mesh, cmap='Blues', shading='auto')
+        fig.colorbar(p_mesh, ax=ax, label='Total Column Mass (kg)', pad=0.1)
+        ax.set_title(f"Cycle {c+1} — Top-Down Mass", pad=20)
+        ax.set_yticklabels([]) # Hide radial ticks
+        fig.savefig(tm_path, dpi=130, bbox_inches='tight'); plt.close(fig)
+        topmass_paths.append(tm_path)
+
+        # 2. Top-Down Surface Temperature (Temp of the highest non-empty cell)
+        top_T = np.full(N_r, np.nan)
+        for i in range(N_r):
+            for j in range(N_z - 1, -1, -1):
+                if M_snapshots[c][i, j] > 1e-6:
+                    top_T[i] = T_snapshots[c][i, j]
+                    break
+        
+        T_mesh = np.tile(top_T, (len(theta), 1))
+        
+        tt_path = os.path.join(outdir, f"b1_toptemp_cyc{c+1}.png")
+        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'})
+        p_mesh_t = ax.pcolormesh(Theta_mesh, R_mesh, T_mesh, cmap='inferno', shading='auto')
+        fig.colorbar(p_mesh_t, ax=ax, label='Surface Temp (°C)', pad=0.1)
+        ax.set_title(f"Cycle {c+1} — Top-Down Surface Temp", pad=20)
+        ax.set_yticklabels([])
+        fig.savefig(tt_path, dpi=130, bbox_inches='tight'); plt.close(fig)
+        toptemp_paths.append(tt_path)
+
+        # --- Phase Bar Chart ---
         pb_path = os.path.join(outdir, f"b1_phasebar_cyc{c+1}.png")
         fig, ax = plt.subplots(figsize=(6, 4))
         phases = ['Solid', 'Slurry', 'Liquid']
         masses = [cyc_sol_kg[c], cyc_slu_kg[c], cyc_liq_kg[c]]
         temps = [cyc_sol_T[c], cyc_slu_T[c], cyc_liq_T[c]]
         colors = ['tab:gray', 'tab:orange', 'tab:blue']
-        
         bars = ax.bar(phases, masses, color=colors)
         for idx, bar in enumerate(bars):
             if masses[idx] > 0:
                 ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(masses)*0.02, 
                         f"{masses[idx]:.0f} kg\n{temps[idx]:.1f} °C", ha='center', fontsize=9)
-                
-        ax.set_ylabel("Mass (kg)")
-        ax.set_title(f"Cycle {c+1} — Phase Distribution")
+        ax.set_ylabel("Mass (kg)"); ax.set_title(f"Cycle {c+1} — Phase Distribution")
         ax.grid(True, alpha=0.3, axis='y')
         fig.savefig(pb_path, dpi=130); plt.close(fig)
         phase_bar_paths.append(pb_path)
@@ -721,6 +720,8 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         "curve_path": curve_path,
         "heatmap_paths": heatmap_paths,
         "massmap_paths": massmap_paths,
+        "topmass_paths": topmass_paths,
+        "toptemp_paths": toptemp_paths,
         "phasebar_paths": phase_bar_paths,
         "total_hr": total_hr,
         "total_extracted_kg": total_drained,

@@ -405,19 +405,35 @@ def write_report_html(outdir, cfg, R_ag, n_ag, results_2d=None):
             m = results_2d["cycle_metrics"][idx]
             hm = os.path.basename(results_2d["heatmap_paths"][idx])
             mm = os.path.basename(results_2d["massmap_paths"][idx])
+            tm = os.path.basename(results_2d["topmass_paths"][idx])
+            tt = os.path.basename(results_2d["toptemp_paths"][idx])
             pb = os.path.basename(results_2d["phasebar_paths"][idx])
+            
             h.append(f"<h3>Cycle {m['cycle']}</h3>")
+            
+            # Lateral views
             h.append("<div class='imgrow'>"
-                     f"<div><h4>Temperature</h4><img src='{hm}' alt='heatmap_{idx}'></div>"
-                     f"<div><h4>Mass Distribution</h4><img src='{mm}' alt='massmap_{idx}'></div>"
+                     f"<div><h4>Lateral Temperature</h4><img src='{hm}' alt='heatmap_{idx}'></div>"
+                     f"<div><h4>Lateral Mass Distribution</h4><img src='{mm}' alt='massmap_{idx}'></div>"
                      "</div>")
+                     
+            # Top-down views
+            h.append("<div class='imgrow'>"
+                     f"<div><h4>Top-Down Total Mass</h4><img src='{tm}' alt='topmass_{idx}'></div>"
+                     f"<div><h4>Top-Down Surface Temperature</h4><img src='{tt}' alt='toptemp_{idx}'></div>"
+                     "</div>")
+                     
+            # Phase Distribution
             h.append("<div class='imgrow'>"
                      f"<div><h4>Phase Distribution</h4><img src='{pb}' alt='phasebar_{idx}'></div>"
                      "</div>")
+                     
+            # Drain metrics table
             if m["extracted_kg"] > 1e-6:
                 temp_str = f"{m['extracted_temp_avg']:.1f} °C"
             else:
                 temp_str = "<span class='nodrain'>—</span>"
+                
             h.append("<table>")
             h.append(f"<tr><td>Fluid in tank (start of heating)</td><td>{m['start_mass']:.1f} kg</td></tr>")
             h.append(f"<tr><td>Fluid in tank (end of heating)</td><td>{m['remaining_mass']:.1f} kg</td></tr>")
