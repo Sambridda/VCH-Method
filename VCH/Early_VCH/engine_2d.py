@@ -1,5 +1,5 @@
 # ============================================================
-# engine_2d.py — 2D Draining Physics Engine (Viscosity Settling)
+# engine_2d.py — 2D Draining Physics Engine (UI Data Provider)
 # ============================================================
 import numpy as np
 from numba import njit, objmode
@@ -99,15 +99,23 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
     drain_log = np.zeros(n_steps)
     time_log = np.zeros(n_steps)
     is_heating_log = np.zeros(n_steps, dtype=np.bool_)
+    status_log = np.zeros(n_steps, dtype=np.int8)
     
     cycle_extracted = np.zeros(n_cycles)
     cycle_idle_hr = np.zeros(n_cycles)
     cycle_produced = np.zeros(n_cycles)
     cycle_stranded = np.zeros(n_cycles)
+    cycle_start_mass = np.zeros(n_cycles)
+    cycle_remaining_mass = np.zeros(n_cycles)
     
     cyc_sol_kg = np.zeros(n_cycles); cyc_sol_T = np.zeros(n_cycles)
     cyc_slu_kg = np.zeros(n_cycles); cyc_slu_T = np.zeros(n_cycles)
     cyc_liq_kg = np.zeros(n_cycles); cyc_liq_T = np.zeros(n_cycles)
+    
+    cycle_extracted_temp_sum = np.zeros(n_cycles)
+    
+    first_drain_time = -1.0
+    last_drain_time = -1.0
     
     T_snapshots = np.full((n_cycles, N_r, N_z), np.nan)
     M_snapshots = np.full((n_cycles, N_r, N_z), np.nan)
@@ -146,6 +154,9 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         is_heating = (step_in_cycle < n_steps_heat)
         is_heating_log[step] = is_heating
         
+        if step_in_cycle == 0:
+            cycle_start_mass[cycle_idx] = np.sum(mass)
+
         T = np.zeros((N_r, N_z))
         for i in range(N_r):
             for j in range(N_z):
@@ -164,7 +175,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     
         avg_surf = np.mean(surf)
 
-        # 2. Coil Heating (Contact Fraction)
+        # 2. Coil Heating
         if is_heating:
             T_coil_avg = 0.0; weight_sum = 0.0
             for i in range(N_r):
@@ -216,14 +227,26 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     q = k_avg * area * (T[i, j] - T[i, j+1]) / dz
                     enthalpy[i, j] -= q * dt
 
+        # ============================================================
         # 4. Draining (Radial Suction Cone)
+        #    [FIX] Now scans the ENTIRE cone for fluid level, preventing
+        #    the drain from choking if the column directly above it empties.
+        # ============================================================
         drained_this_step = 0.0
         if is_heating:
+            R_suction_float = avg_surf * (dz / dr)
+            R_suction = max(1, int(R_suction_float))
+            i_min = max(0, drain_r - R_suction)
+            i_max = min(N_r - 1, drain_r + R_suction)
+
+            # Find the highest liquid level in the entire suction cone
             surf_drain = -1
-            for j in range(N_z - 1, drain_z - 1, -1):
-                if mass[drain_r, j] > 1e-6 and T[drain_r, j] > T_me:
-                    surf_drain = j
-                    break
+            for i in range(i_min, i_max + 1):
+                for j in range(N_z - 1, drain_z - 1, -1):
+                    if mass[i, j] > 1e-6 and T[i, j] > T_me:
+                        if j > surf_drain:
+                            surf_drain = j
+                        break
             
             if surf_drain > drain_z:
                 h_head = (surf_drain - drain_z) * dz
@@ -231,17 +254,11 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 v_flow = 0.6 * np.sqrt(2.0 * 9.81 * h_head)
                 target_mass = rho_liq * v_flow * drain_area * dt
                 
-                R_suction_float = avg_surf * (dz / dr)
-                R_suction = max(1, int(R_suction_float))
-                
-                i_start = drain_r
-                i_end = max(0, drain_r - R_suction)
-                
                 w_array = np.zeros(N_r)
                 j_array = np.zeros(N_r, dtype=np.int64)
                 total_weight = 0.0
                 
-                for i in range(i_start, i_end - 1, -1):
+                for i in range(i_min, i_max + 1):
                     best_j = -1
                     for j in range(drain_z, N_z):
                         if mass[i, j] > 1e-6 and T[i, j] > T_soft:
@@ -258,7 +275,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                             total_weight += w
                             
                 if total_weight > 0.0:
-                    for i in range(i_start, i_end - 1, -1):
+                    for i in range(i_min, i_max + 1):
                         if w_array[i] > 0.0:
                             dm = target_mass * (w_array[i] / total_weight)
                             actual_dm = min(dm, mass[i, j_array[i]])
@@ -269,17 +286,30 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                                 mass[i, j_array[i]] -= actual_dm
                                 drained_mass_cum += actual_dm
                                 drained_this_step += actual_dm
+                                
+                                cycle_extracted_temp_sum[cycle_idx] += actual_dm * T[i, j_array[i]]
+                                
+                                if first_drain_time < 0:
+                                    first_drain_time = time_log[step]
+                                last_drain_time = time_log[step]
+
+        # [DATA] Capture drain activity BEFORE makeup decrements it
+        did_drain = drained_this_step > 0.0
         
-        if is_heating and drained_this_step == 0.0:
+        if is_heating and not did_drain:
             idle_time += dt / 3600.0
 
+        # ============================================================
         # 5. Make-up Fluid
+        # ============================================================
         if has_makeup == 1 and drained_this_step > 0.0:
             h_makeup = np.interp(makeup_T, T_grid, H_grid)
+            rho_fill = np.interp(makeup_T, T_grid, rho_grid)
             j_top = N_z - 1
             for i in range(N_r):
-                if mass[i, j_top] < V_cell[i, j_top]:
-                    needed = V_cell[i, j_top] - mass[i, j_top]
+                cap_mass = V_cell[i, j_top] * rho_fill
+                if mass[i, j_top] < cap_mass:
+                    needed = cap_mass - mass[i, j_top]
                     added = min(needed, drained_this_step)
                     mass[i, j_top] += added
                     enthalpy[i, j_top] += added * h_makeup
@@ -287,30 +317,48 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     if drained_this_step <= 1e-6: break
             
         drain_log[step] = drained_mass_cum
-        
+
+        # Refresh surface heights post-drain
+        for i in range(N_r):
+            surf[i] = 0
+            for j in range(N_z - 1, -1, -1):
+                if mass[i, j] > 1e-6:
+                    surf[i] = j
+                    break
+
+        # ============================================================
         # 6. Vertical Collapse (Viscosity & Pressure Head)
+        # ============================================================
         if has_makeup == 0:
             for j in range(0, N_z - 1):
                 for i in range(N_r):
-                    if mass[i, j] < V_cell[i, j] and mass[i, j+1] > 1e-6:
-                        needed = V_cell[i, j] - mass[i, j]
-                        available = mass[i, j+1]
-                        
-                        h_head = (surf[i] - j) * dz
-                        mu_above = np.interp(T[i, j+1], T_grid, mu_grid)
-                        
-                        mobility = (K_settle * h_head) / max(1e-6, mu_above)
-                        mobility = min(1.0, max(0.01, mobility))
-                        
-                        moved = min(needed * mobility, available)
-                        
-                        if moved > 1e-9:
-                            h_spec = enthalpy[i, j+1] / max(1e-6, mass[i, j+1])
-                            mass[i, j] += moved; mass[i, j+1] -= moved
-                            enthalpy[i, j] += moved * h_spec
-                            enthalpy[i, j+1] -= moved * h_spec
+                    if mass[i, j+1] <= 1e-6:
+                        continue
+                    T_src = T[i, j+1]
+                    rho_src = np.interp(T_src, T_grid, rho_grid)
+                    cap_mass = V_cell[i, j] * rho_src
+                    needed = cap_mass - mass[i, j]
+                    if needed <= 1e-9:
+                        continue
 
+                    h_head = (surf[i] - j) * dz
+                    mu_above = np.interp(T_src, T_grid, mu_grid)
+
+                    mobility = (K_settle * h_head) / max(1e-6, mu_above)
+                    mobility = min(1.0, max(0.01, mobility))
+
+                    moved = min(needed * mobility, mass[i, j+1])
+
+                    if moved > 1e-9:
+                        h_spec = enthalpy[i, j+1] / max(1e-6, mass[i, j+1])
+                        mass[i, j] += moved; mass[i, j+1] -= moved
+                        enthalpy[i, j] += moved * h_spec
+                        enthalpy[i, j+1] -= moved * h_spec
+
+        # ============================================================
         # 7. Horizontal Surface Leveling (Bidirectional Cascade)
+        #    Includes capacity checks to prevent infinite mass pileup.
+        # ============================================================
         if has_makeup == 0:
             surf = np.zeros(N_r, dtype=np.int64)
             for i in range(N_r):
@@ -320,41 +368,63 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         surf[i] = j
                         break
 
+            # Forward pass
             for i in range(N_r - 1):
                 if surf[i] > surf[i+1]:
                     j_top = surf[i]; j_target = surf[i+1]
                     if T[i, j_top] > T_soft:
-                        moved = mass[i, j_top] * 0.5
-                        h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
-                        mass[i, j_top] -= moved; mass[i+1, j_target] += moved
-                        enthalpy[i, j_top] -= moved * h_spec
-                        enthalpy[i+1, j_target] += moved * h_spec
+                        rho_tgt = np.interp(T[i+1, j_target], T_grid, rho_grid)
+                        cap_mass = V_cell[i+1, j_target] * rho_tgt
+                        needed = cap_mass - mass[i+1, j_target]
+                        
+                        if needed > 1e-9:
+                            moved = min(mass[i, j_top] * 0.5, needed)
+                            h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
+                            mass[i, j_top] -= moved; mass[i+1, j_target] += moved
+                            enthalpy[i, j_top] -= moved * h_spec
+                            enthalpy[i+1, j_target] += moved * h_spec
                 elif surf[i+1] > surf[i]:
                     j_top = surf[i+1]; j_target = surf[i]
                     if T[i+1, j_top] > T_soft:
-                        moved = mass[i+1, j_top] * 0.5
-                        h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
-                        mass[i+1, j_top] -= moved; mass[i, j_target] += moved
-                        enthalpy[i+1, j_top] -= moved * h_spec
-                        enthalpy[i, j_target] += moved * h_spec
+                        rho_tgt = np.interp(T[i, j_target], T_grid, rho_grid)
+                        cap_mass = V_cell[i, j_target] * rho_tgt
+                        needed = cap_mass - mass[i, j_target]
+                        
+                        if needed > 1e-9:
+                            moved = min(mass[i+1, j_top] * 0.5, needed)
+                            h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
+                            mass[i+1, j_top] -= moved; mass[i, j_target] += moved
+                            enthalpy[i+1, j_top] -= moved * h_spec
+                            enthalpy[i, j_target] += moved * h_spec
 
+            # Backward pass
             for i in range(N_r - 2, -1, -1):
                 if surf[i] > surf[i+1]:
                     j_top = surf[i]; j_target = surf[i+1]
                     if T[i, j_top] > T_soft:
-                        moved = mass[i, j_top] * 0.5
-                        h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
-                        mass[i, j_top] -= moved; mass[i+1, j_target] += moved
-                        enthalpy[i, j_top] -= moved * h_spec
-                        enthalpy[i+1, j_target] += moved * h_spec
+                        rho_tgt = np.interp(T[i+1, j_target], T_grid, rho_grid)
+                        cap_mass = V_cell[i+1, j_target] * rho_tgt
+                        needed = cap_mass - mass[i+1, j_target]
+                        
+                        if needed > 1e-9:
+                            moved = min(mass[i, j_top] * 0.5, needed)
+                            h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
+                            mass[i, j_top] -= moved; mass[i+1, j_target] += moved
+                            enthalpy[i, j_top] -= moved * h_spec
+                            enthalpy[i+1, j_target] += moved * h_spec
                 elif surf[i+1] > surf[i]:
                     j_top = surf[i+1]; j_target = surf[i]
                     if T[i+1, j_top] > T_soft:
-                        moved = mass[i+1, j_top] * 0.5
-                        h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
-                        mass[i+1, j_top] -= moved; mass[i, j_target] += moved
-                        enthalpy[i+1, j_top] -= moved * h_spec
-                        enthalpy[i, j_target] += moved * h_spec
+                        rho_tgt = np.interp(T[i, j_target], T_grid, rho_grid)
+                        cap_mass = V_cell[i, j_target] * rho_tgt
+                        needed = cap_mass - mass[i, j_target]
+                        
+                        if needed > 1e-9:
+                            moved = min(mass[i+1, j_top] * 0.5, needed)
+                            h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
+                            mass[i+1, j_top] -= moved; mass[i, j_target] += moved
+                            enthalpy[i+1, j_top] -= moved * h_spec
+                            enthalpy[i, j_target] += moved * h_spec
 
         # 8. Wall Heat Loss
         for j in range(N_z):
@@ -362,6 +432,14 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 area = 2.0 * np.pi * ((N_r - 1) * dr) * dz
                 q_loss = U_tank_air * area * (T[N_r-1, j] - T_amb)
                 enthalpy[N_r-1, j] -= q_loss * dt
+
+        # [DATA] Record per-step status
+        if not is_heating:
+            status_log[step] = -1
+        elif did_drain:
+            status_log[step] = 1
+        else:
+            status_log[step] = 0
 
         # --- End of Heating Phase Snapshot & Cycle Metrics ---
         if is_heating and (step_in_cycle == n_steps_heat - 1):
@@ -384,6 +462,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             cycle_extracted[cycle_idx] = drained_mass_cum - extracted_so_far
             cycle_idle_hr[cycle_idx] = idle_time - idle_so_far
             cycle_produced[cycle_idx] = cycle_extracted[cycle_idx] + (liquid_now - stranded_prev)
+            cycle_remaining_mass[cycle_idx] = np.sum(mass)
             
             extracted_so_far = drained_mass_cum
             idle_so_far = idle_time
@@ -415,7 +494,9 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
 
     return (time_log, drain_log, drained_mass_cum, idle_time, T, mass, is_heating_log, 
             T_snapshots, M_snapshots, cycle_extracted, cycle_idle_hr, cycle_produced, cycle_stranded,
-            cyc_sol_kg, cyc_slu_kg, cyc_liq_kg, cyc_sol_T, cyc_slu_T, cyc_liq_T)
+            cyc_sol_kg, cyc_slu_kg, cyc_liq_kg, cyc_sol_T, cyc_slu_T, cyc_liq_T,
+            first_drain_time, last_drain_time, cycle_start_mass, cycle_remaining_mass,
+            cycle_extracted_temp_sum, status_log)
 
 # ------------------------------------------------------------
 # DRIVER FUNCTION
@@ -434,13 +515,14 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     mass = np.zeros((N_r, N_z))
     enthalpy = np.zeros((N_r, N_z))
     
-    rho_amb = max(1e-6, np.interp(cfg["T_amb_mid"], mat["T_grid"], mat["rho_grid"]))
-    h_spec_amb = np.interp(cfg["T_amb_mid"], mat["T_grid"], mat["H_grid"])
+    T_start = float(cfg.get("T_start", cfg["T_amb_mid"]))
+    rho_start = max(1e-6, np.interp(T_start, mat["T_grid"], mat["rho_grid"]))
+    h_spec_start = float(np.interp(T_start, mat["T_grid"], mat["H_grid"]))
     
+    M_fluid_eff = float(cfg.get("M_fluid_effective", cfg["M_fluid"]))
     V_total_tank = np.pi * cfg["r_inner"]**2 * tank_height
-    V_target = cfg["M_fluid"] / rho_amb
+    V_target = M_fluid_eff / rho_start
     fill_fraction = V_target / max(1e-6, V_total_tank)
-    
     if fill_fraction > 1.0: fill_fraction = 1.0
     
     j_fill_float = fill_fraction * N_z
@@ -453,16 +535,15 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         
         for j in range(N_z):
             if j < j_fill_int:
-                mass[i, j] = V_cell * rho_amb
-                enthalpy[i, j] = mass[i, j] * h_spec_amb
+                mass[i, j] = V_cell * rho_start
+                enthalpy[i, j] = mass[i, j] * h_spec_start
             elif j == j_fill_int:
-                mass[i, j] = V_cell * rho_amb * j_fill_partial
-                enthalpy[i, j] = mass[i, j] * h_spec_amb
+                mass[i, j] = V_cell * rho_start * j_fill_partial
+                enthalpy[i, j] = mass[i, j] * h_spec_start
             else:
                 mass[i, j] = 0.0
                 enthalpy[i, j] = 0.0
 
-    # --- CONTACT FRACTION COIL WEIGHTS ---
     coil_w = np.zeros((N_r, N_z))
     r_lo = R_coil - cfg["d_out"]/2.0
     r_hi = R_coil + cfg["d_out"]/2.0
@@ -492,8 +573,10 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     drain_r_idx, drain_z_idx = drain_location
     
     T_drain_init = np.interp(enthalpy[drain_r_idx, drain_z_idx] / max(1e-6, mass[drain_r_idx, drain_z_idx]), mat["H_grid"], mat["T_grid"]) if mass[drain_r_idx, drain_z_idx] > 0 else cfg["T_amb_mid"]
-    if T_drain_init < cfg["T_me"]:
-        print(f"  WARNING: The drain cell is currently SOLID ({T_drain_init:.1f} °C). It will idle until heat reaches it.")
+    if T_drain_init < cfg["T_ms"]:
+        print(f"  WARNING: Drain cell is SOLID ({T_drain_init:.1f} °C). It will idle until heat reaches it.")
+    elif T_drain_init <= cfg["T_me"]:
+        print(f"  NOTE: Drain cell is in the melt band ({T_drain_init:.1f} °C). Draining may be sluggish initially.")
     
     drain_area = np.pi * (drain_diameter / 2.0)**2
     A_coil_total = 2.0 * np.pi * R_coil * n_turns * cfg["d_out"]
@@ -512,7 +595,9 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     
     (time_log, drain_log, total_drained, idle_hr, final_T, final_mass, 
      is_heating_log, T_snapshots, M_snapshots, cycle_extracted, cycle_idle, cycle_produced, cycle_stranded,
-     cyc_sol_kg, cyc_slu_kg, cyc_liq_kg, cyc_sol_T, cyc_slu_T, cyc_liq_T) = kernel_2d(
+     cyc_sol_kg, cyc_slu_kg, cyc_liq_kg, cyc_sol_T, cyc_slu_T, cyc_liq_T,
+     first_drain, last_drain, cycle_start_mass, cycle_remaining_mass,
+     cycle_extracted_temp_sum, status_log) = kernel_2d(
         mass, enthalpy, N_r, N_z, dr, dz, 
         coil_w, R_coil, A_coil_total, cfg["d_in"], cfg["d_out"], cfg["R_f_out"], 
         cfg["flow_m3h"] * float(np.interp(cfg["T_water_in"], cfg["T_water_arr"], cfg["rho_water_arr"])) / 3600.0,
@@ -526,7 +611,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"], cfg["beta_liq"], cfg["dT_natural"]
     )
 
-    # 1. Extraction Curve
     curve_path = os.path.join(outdir, f"b1_drain_curve.png")
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(time_log, drain_log, linewidth=2, color="tab:blue", label="Extracted Liquid")
@@ -552,7 +636,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     ax.grid(True, alpha=0.3)
     fig.savefig(curve_path, dpi=130); plt.close(fig)
 
-    # 2. Heatmaps, Mass Maps, Phase Bars
     heatmap_paths = []
     massmap_paths = []
     phase_bar_paths = []
@@ -565,7 +648,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         r_wall_end = cfg["r_inner"] + cfg["t_wall"]
         r_ins_end = r_wall_end + cfg["t_ins"]
         
-        # Heatmap
         h_path = os.path.join(outdir, f"b1_heatmap_cyc{c+1}.png")
         fig, ax = plt.subplots(figsize=(10, 8))
         cmap = plt.cm.inferno.copy()
@@ -580,7 +662,7 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         fig.colorbar(c_mesh, ax=ax, label='Temperature (°C)')
         ax.set_xlabel("Radius (m)")
         ax.set_ylabel("Height (m)")
-        ax.set_title(f"Cycle {c+1} — Temp (with Wall & Insulation)")
+        ax.set_title(f"Cycle {c+1} — Temp")
         ax.set_xlim(0, r_ins_end)
         
         ax.axhline(cfg["coil_clearance_bottom"], color='cyan', linestyle='--', linewidth=1)
@@ -589,7 +671,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         fig.savefig(h_path, dpi=130); plt.close(fig)
         heatmap_paths.append(h_path)
 
-        # Mass Map
         m_path = os.path.join(outdir, f"b1_massmap_cyc{c+1}.png")
         fig, ax = plt.subplots(figsize=(10, 8))
         cmap_m = plt.cm.Blues.copy()
@@ -604,7 +685,7 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         fig.colorbar(m_mesh, ax=ax, label='Mass (kg)')
         ax.set_xlabel("Radius (m)")
         ax.set_ylabel("Height (m)")
-        ax.set_title(f"Cycle {c+1} — Mass (with Wall & Insulation)")
+        ax.set_title(f"Cycle {c+1} — Mass")
         ax.set_xlim(0, r_ins_end)
         
         ax.axhline(cfg["coil_clearance_bottom"], color='red', linestyle='--', linewidth=1)
@@ -613,7 +694,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         fig.savefig(m_path, dpi=130); plt.close(fig)
         massmap_paths.append(m_path)
 
-        # Phase Bar Chart
         pb_path = os.path.join(outdir, f"b1_phasebar_cyc{c+1}.png")
         fig, ax = plt.subplots(figsize=(6, 4))
         phases = ['Solid', 'Slurry', 'Liquid']
@@ -633,18 +713,19 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         fig.savefig(pb_path, dpi=130); plt.close(fig)
         phase_bar_paths.append(pb_path)
 
-    # Build cycle metrics
     cycle_metrics = []
     for c in range(n_cycles):
-        eff = (cycle_extracted[c] / cycle_produced[c] * 100.0) if cycle_produced[c] > 0 else 0.0
-        idle_p = (cycle_idle[c] / max(1e-6, cfg["t_window_hr"]) * 100.0) if cfg["t_window_hr"] > 0 else 0.0
+        eff = (cycle_extracted[c] / cycle_start_mass[c] * 100.0) if cycle_start_mass[c] > 0 else 0.0
+        util = ((cfg["t_window_hr"] - cycle_idle[c]) / cfg["t_window_hr"] * 100.0) if cfg["t_window_hr"] > 0 else 0.0
+        avg_T_ext = cycle_extracted_temp_sum[c] / max(1e-6, cycle_extracted[c])
         cycle_metrics.append({
             "cycle": c + 1,
-            "produced_kg": cycle_produced[c],
+            "start_mass": cycle_start_mass[c],
+            "remaining_mass": cycle_remaining_mass[c],
             "extracted_kg": cycle_extracted[c],
-            "stranded_kg": cycle_stranded[c],
+            "extracted_temp_avg": avg_T_ext,
             "efficiency_pct": eff,
-            "idle_pct": idle_p
+            "utilisation_pct": util
         })
 
     return {
@@ -654,5 +735,10 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         "phasebar_paths": phase_bar_paths,
         "total_hr": total_hr,
         "total_extracted_kg": total_drained,
-        "cycle_metrics": cycle_metrics
+        "final_mass": float(np.sum(final_mass)),
+        "first_drain": float(first_drain),
+        "last_drain": float(last_drain),
+        "cycle_metrics": cycle_metrics,
+        "status_log": status_log,
+        "dt_sec": float(cfg["dt_sec"]),
     }
