@@ -1,5 +1,5 @@
 # ============================================================
-# engine_2d.py — 2D Draining Physics Engine (Cascading Surface Leveling)
+# engine_2d.py — 2D Draining Physics Engine (Viscosity Settling)
 # ============================================================
 import numpy as np
 from numba import njit, objmode
@@ -91,6 +91,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
               T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
               T_tube_arr, k_tube_arr, 
               dt, n_steps, n_steps_heat, n_steps_cool, n_cycles, T_amb, U_tank_air,
+              K_settle,
               has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
     
     drained_mass_cum = 0.0
@@ -153,6 +154,16 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 else:
                     T[i, j] = T_amb 
 
+        surf = np.zeros(N_r, dtype=np.int64)
+        for i in range(N_r):
+            surf[i] = 0
+            for j in range(N_z - 1, -1, -1):
+                if mass[i, j] > 1e-6:
+                    surf[i] = j
+                    break
+                    
+        avg_surf = np.mean(surf)
+
         # 2. Coil Heating (Contact Fraction)
         if is_heating:
             T_coil_avg = 0.0; weight_sum = 0.0
@@ -205,7 +216,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     q = k_avg * area * (T[i, j] - T[i, j+1]) / dz
                     enthalpy[i, j] -= q * dt
 
-        # 4. Draining (Localized Punch-Through)
+        # 4. Draining (Radial Suction Cone)
         drained_this_step = 0.0
         if is_heating:
             surf_drain = -1
@@ -218,21 +229,46 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 h_head = (surf_drain - drain_z) * dz
                 rho_liq = np.interp(T_me, T_grid, rho_grid)
                 v_flow = 0.6 * np.sqrt(2.0 * 9.81 * h_head)
-                mass_rate_kg_s = rho_liq * v_flow * drain_area
+                target_mass = rho_liq * v_flow * drain_area * dt
                 
-                drain_cell_j = drain_z
-                for j in range(drain_z, N_z):
-                    if mass[drain_r, j] > 1e-6:
-                        drain_cell_j = j
-                        break
-                        
-                actual_drain = min(mass_rate_kg_s * dt, mass[drain_r, drain_cell_j])
-                if actual_drain > 0.0:
-                    fraction = actual_drain / max(1e-6, mass[drain_r, drain_cell_j])
-                    enthalpy[drain_r, drain_cell_j] *= (1.0 - fraction)
-                    mass[drain_r, drain_cell_j] -= actual_drain
-                    drained_mass_cum += actual_drain
-                    drained_this_step = actual_drain
+                R_suction_float = avg_surf * (dz / dr)
+                R_suction = max(1, int(R_suction_float))
+                
+                i_start = drain_r
+                i_end = max(0, drain_r - R_suction)
+                
+                w_array = np.zeros(N_r)
+                j_array = np.zeros(N_r, dtype=np.int64)
+                total_weight = 0.0
+                
+                for i in range(i_start, i_end - 1, -1):
+                    best_j = -1
+                    for j in range(drain_z, N_z):
+                        if mass[i, j] > 1e-6 and T[i, j] > T_soft:
+                            best_j = j
+                            break
+                    
+                    if best_j != -1:
+                        dist = abs(i - drain_r) * dr
+                        max_dist = R_suction * dr
+                        w = 1.0 - (dist / max_dist) if max_dist > 0 else 1.0
+                        if w > 0.0:
+                            w_array[i] = w
+                            j_array[i] = best_j
+                            total_weight += w
+                            
+                if total_weight > 0.0:
+                    for i in range(i_start, i_end - 1, -1):
+                        if w_array[i] > 0.0:
+                            dm = target_mass * (w_array[i] / total_weight)
+                            actual_dm = min(dm, mass[i, j_array[i]])
+                            
+                            if actual_dm > 0.0:
+                                fraction = actual_dm / max(1e-6, mass[i, j_array[i]])
+                                enthalpy[i, j_array[i]] *= (1.0 - fraction)
+                                mass[i, j_array[i]] -= actual_dm
+                                drained_mass_cum += actual_dm
+                                drained_this_step += actual_dm
         
         if is_heating and drained_this_step == 0.0:
             idle_time += dt / 3600.0
@@ -252,14 +288,22 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             
         drain_log[step] = drained_mass_cum
         
-        # 6. Vertical Collapse (Bottom-Up Piston)
+        # 6. Vertical Collapse (Viscosity & Pressure Head)
         if has_makeup == 0:
             for j in range(0, N_z - 1):
                 for i in range(N_r):
                     if mass[i, j] < V_cell[i, j] and mass[i, j+1] > 1e-6:
                         needed = V_cell[i, j] - mass[i, j]
                         available = mass[i, j+1]
-                        moved = min(needed, available)
+                        
+                        h_head = (surf[i] - j) * dz
+                        mu_above = np.interp(T[i, j+1], T_grid, mu_grid)
+                        
+                        mobility = (K_settle * h_head) / max(1e-6, mu_above)
+                        mobility = min(1.0, max(0.01, mobility))
+                        
+                        moved = min(needed * mobility, available)
+                        
                         if moved > 1e-9:
                             h_spec = enthalpy[i, j+1] / max(1e-6, mass[i, j+1])
                             mass[i, j] += moved; mass[i, j+1] -= moved
@@ -268,7 +312,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
 
         # 7. Horizontal Surface Leveling (Bidirectional Cascade)
         if has_makeup == 0:
-            # Find surface for each column
             surf = np.zeros(N_r, dtype=np.int64)
             for i in range(N_r):
                 surf[i] = 0
@@ -277,11 +320,9 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         surf[i] = j
                         break
 
-            # Forward Pass (Left to Right)
             for i in range(N_r - 1):
                 if surf[i] > surf[i+1]:
-                    j_top = surf[i]
-                    j_target = surf[i+1]
+                    j_top = surf[i]; j_target = surf[i+1]
                     if T[i, j_top] > T_soft:
                         moved = mass[i, j_top] * 0.5
                         h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
@@ -289,8 +330,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i, j_top] -= moved * h_spec
                         enthalpy[i+1, j_target] += moved * h_spec
                 elif surf[i+1] > surf[i]:
-                    j_top = surf[i+1]
-                    j_target = surf[i]
+                    j_top = surf[i+1]; j_target = surf[i]
                     if T[i+1, j_top] > T_soft:
                         moved = mass[i+1, j_top] * 0.5
                         h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
@@ -298,11 +338,9 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i+1, j_top] -= moved * h_spec
                         enthalpy[i, j_target] += moved * h_spec
 
-            # Backward Pass (Right to Left)
             for i in range(N_r - 2, -1, -1):
                 if surf[i] > surf[i+1]:
-                    j_top = surf[i]
-                    j_target = surf[i+1]
+                    j_top = surf[i]; j_target = surf[i+1]
                     if T[i, j_top] > T_soft:
                         moved = mass[i, j_top] * 0.5
                         h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
@@ -310,8 +348,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                         enthalpy[i, j_top] -= moved * h_spec
                         enthalpy[i+1, j_target] += moved * h_spec
                 elif surf[i+1] > surf[i]:
-                    j_top = surf[i+1]
-                    j_target = surf[i]
+                    j_top = surf[i+1]; j_target = surf[i]
                     if T[i+1, j_top] > T_soft:
                         moved = mass[i+1, j_top] * 0.5
                         h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
@@ -485,6 +522,7 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"],
         cfg["T_tube_arr"], cfg["k_tube_arr"],
         cfg["dt_sec"], total_steps, n_steps_heat, n_steps_cool, n_cycles, cfg["T_amb_mid"], U_tank_air,
+        cfg["K_settle"],
         cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"], cfg["beta_liq"], cfg["dT_natural"]
     )
 

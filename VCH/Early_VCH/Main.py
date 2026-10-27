@@ -182,7 +182,7 @@ def gather_inputs():
     makeup_T = pf("  Make-up fluid feed temperature degC", 20.0) if has_makeup else 20.0
 
     print("\n--- Tank fluid mass ---")
-    V_tank = np.pi * r_inner**2 * tank_height # <--- FIXED: Use tank_height
+    V_tank = np.pi * r_inner**2 * tank_height
     m_fill = V_tank * float(np.interp(T_amb_low, T_solid_arr, rho_solid_arr))
     print(f"  Maximum capacity (to tank rim): {m_fill:.0f} kg")
     s = input(f"  Enter [f] to fill to max ({m_fill:.0f} kg), or mass in kg: ").strip().lower()
@@ -201,6 +201,11 @@ def gather_inputs():
     t_cooldown_hr = pf("  Cooldown window per phase h", 12.0)
     N_cycles = pi_prompt("  Number of cycles (ends on heating)", 1, lo=1, hi=20)
     
+    print("\n  Settling Coefficient (K_settle):")
+    print("    Scales how fast the fluid settles vertically under gravity.")
+    print("    Higher = faster drop, Lower = sluggish/slurry-like drop.")
+    K_settle = pf("  Settling Coefficient K_settle", 1.0, lo=0.001, hi=100.0)
+
     N = pi_prompt("  Radial nodes N (1D)", 100, lo=20, hi=500)
     dt_sec = pf("  Timestep dt s", 1.0, lo=0.1, hi=60.0)
     N_radii = pi_prompt("  Number of radii to explore", 3, lo=2, hi=20)
@@ -226,7 +231,8 @@ def gather_inputs():
         has_makeup=has_makeup, makeup_T=makeup_T,
         T_water_in=T_water_in, flow_m3h=flow_m3h, T_amb_low=T_amb_low, T_amb_mid=T_amb_mid, T_amb_hot=T_amb_hot,
         t_window_hr=t_window_hr, t_cooldown_hr=t_cooldown_hr, N_cycles=N_cycles, dt_sec=dt_sec, N=N, n_samples=n_samples, N_radii=N_radii,
-        has_agitator=has_ag, ag_type=ag_type, N_rpm=N_rpm, D_imp=D_imp, visc_corr=visc_corr, beta_liq=beta_liq, dT_natural=dT_natural
+        has_agitator=has_ag, ag_type=ag_type, N_rpm=N_rpm, D_imp=D_imp, visc_corr=visc_corr, beta_liq=beta_liq, dT_natural=dT_natural,
+        K_settle=K_settle
     )
 
 def build_material_tables(cfg):
@@ -380,8 +386,6 @@ def main():
     print(f"\nOutput: {outdir}")
 
     geom, n_max, radii, turns = engine_1d.build_geometry(cfg)
-    
-    # Updated Presets based on user request
     presets = [("expected_cold", cfg["T_amb_low"]), ("ambient", cfg["T_amb_mid"]), ("best_case", cfg["T_amb_hot"])]
 
     print(f"\n--- Phase A: cold-start sweep ({len(radii)} radii x {len(turns)} turns x 3 ambients) ---")
