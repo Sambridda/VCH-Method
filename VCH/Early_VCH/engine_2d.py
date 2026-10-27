@@ -1,5 +1,5 @@
 # ============================================================
-# engine_2d.py — 2D Draining Physics Engine (Final Physics Logic)
+# engine_2d.py — 2D Draining Physics Engine (Cascading Surface Leveling)
 # ============================================================
 import numpy as np
 from numba import njit, objmode
@@ -118,6 +118,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             V_cell[i, j] = np.pi * (r_out**2 - r_in**2) * dz
             
     cycle_len = max(1, n_steps_heat + n_steps_cool)
+    T_soft = T_ms - 10.0 
 
     stranded_prev = 0.0
     for i in range(N_r):
@@ -144,7 +145,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         is_heating = (step_in_cycle < n_steps_heat)
         is_heating_log[step] = is_heating
         
-        # 1. Calculate Temperature Matrix
         T = np.zeros((N_r, N_z))
         for i in range(N_r):
             for j in range(N_z):
@@ -252,7 +252,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             
         drain_log[step] = drained_mass_cum
         
-        # 6. VERTICAL COLLAPSE (Bottom-Up)
+        # 6. Vertical Collapse (Bottom-Up Piston)
         if has_makeup == 0:
             for j in range(0, N_z - 1):
                 for i in range(N_r):
@@ -266,77 +266,58 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                             enthalpy[i, j] += moved * h_spec
                             enthalpy[i, j+1] -= moved * h_spec
 
-        # 7. HORIZONTAL LEVELING (Viscosity-Dependent)
+        # 7. Horizontal Surface Leveling (Bidirectional Cascade)
         if has_makeup == 0:
-            for j in range(N_z):
-                # Forward Pass
-                for i in range(N_r - 1):
-                    ff_i = mass[i, j] / max(1e-6, V_cell[i, j])
-                    ff_next = mass[i+1, j] / max(1e-6, V_cell[i+1, j])
-                    
-                    if abs(ff_i - ff_next) > 0.001:
-                        m_tot = mass[i, j] + mass[i+1, j]
-                        v_tot = V_cell[i, j] + V_cell[i+1, j]
-                        
-                        # Mobility based on temperature/viscosity
-                        mobility = 0.0
-                        if T[i, j] >= T_me:
-                            mobility = 1.0
-                        elif T[i, j] > T_ms:
-                            mobility = (T[i, j] - T_ms) / (T_me - T_ms)
-                        else:
-                            mobility = 0.01 # Highly viscous / solid
-                            
-                        if ff_i > ff_next:
-                            target_m_i = m_tot * (V_cell[i, j] / v_tot)
-                            moved = (mass[i, j] - target_m_i) * mobility
-                            if moved > 1e-9:
-                                h_spec = enthalpy[i, j] / max(1e-6, mass[i, j])
-                                mass[i, j] -= moved; mass[i+1, j] += moved
-                                enthalpy[i, j] -= moved * h_spec
-                                enthalpy[i+1, j] += moved * h_spec
-                        elif ff_next > ff_i:
-                            target_m_next = m_tot * (V_cell[i+1, j] / v_tot)
-                            moved = (mass[i+1, j] - target_m_next) * mobility
-                            if moved > 1e-9:
-                                h_spec = enthalpy[i+1, j] / max(1e-6, mass[i+1, j])
-                                mass[i+1, j] -= moved; mass[i, j] += moved
-                                enthalpy[i+1, j] -= moved * h_spec
-                                enthalpy[i, j] += moved * h_spec
+            # Find surface for each column
+            surf = np.zeros(N_r, dtype=np.int64)
+            for i in range(N_r):
+                surf[i] = 0
+                for j in range(N_z - 1, -1, -1):
+                    if mass[i, j] > 1e-6:
+                        surf[i] = j
+                        break
 
-                # Backward Pass
-                for i in range(N_r - 2, -1, -1):
-                    ff_i = mass[i, j] / max(1e-6, V_cell[i, j])
-                    ff_next = mass[i+1, j] / max(1e-6, V_cell[i+1, j])
-                    
-                    if abs(ff_i - ff_next) > 0.001:
-                        m_tot = mass[i, j] + mass[i+1, j]
-                        v_tot = V_cell[i, j] + V_cell[i+1, j]
-                        
-                        mobility = 0.0
-                        if T[i, j] >= T_me:
-                            mobility = 1.0
-                        elif T[i, j] > T_ms:
-                            mobility = (T[i, j] - T_ms) / (T_me - T_ms)
-                        else:
-                            mobility = 0.01
-                            
-                        if ff_i > ff_next:
-                            target_m_i = m_tot * (V_cell[i, j] / v_tot)
-                            moved = (mass[i, j] - target_m_i) * mobility
-                            if moved > 1e-9:
-                                h_spec = enthalpy[i, j] / max(1e-6, mass[i, j])
-                                mass[i, j] -= moved; mass[i+1, j] += moved
-                                enthalpy[i, j] -= moved * h_spec
-                                enthalpy[i+1, j] += moved * h_spec
-                        elif ff_next > ff_i:
-                            target_m_next = m_tot * (V_cell[i+1, j] / v_tot)
-                            moved = (mass[i+1, j] - target_m_next) * mobility
-                            if moved > 1e-9:
-                                h_spec = enthalpy[i+1, j] / max(1e-6, mass[i+1, j])
-                                mass[i+1, j] -= moved; mass[i, j] += moved
-                                enthalpy[i+1, j] -= moved * h_spec
-                                enthalpy[i, j] += moved * h_spec
+            # Forward Pass (Left to Right)
+            for i in range(N_r - 1):
+                if surf[i] > surf[i+1]:
+                    j_top = surf[i]
+                    j_target = surf[i+1]
+                    if T[i, j_top] > T_soft:
+                        moved = mass[i, j_top] * 0.5
+                        h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
+                        mass[i, j_top] -= moved; mass[i+1, j_target] += moved
+                        enthalpy[i, j_top] -= moved * h_spec
+                        enthalpy[i+1, j_target] += moved * h_spec
+                elif surf[i+1] > surf[i]:
+                    j_top = surf[i+1]
+                    j_target = surf[i]
+                    if T[i+1, j_top] > T_soft:
+                        moved = mass[i+1, j_top] * 0.5
+                        h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
+                        mass[i+1, j_top] -= moved; mass[i, j_target] += moved
+                        enthalpy[i+1, j_top] -= moved * h_spec
+                        enthalpy[i, j_target] += moved * h_spec
+
+            # Backward Pass (Right to Left)
+            for i in range(N_r - 2, -1, -1):
+                if surf[i] > surf[i+1]:
+                    j_top = surf[i]
+                    j_target = surf[i+1]
+                    if T[i, j_top] > T_soft:
+                        moved = mass[i, j_top] * 0.5
+                        h_spec = enthalpy[i, j_top] / max(1e-6, mass[i, j_top])
+                        mass[i, j_top] -= moved; mass[i+1, j_target] += moved
+                        enthalpy[i, j_top] -= moved * h_spec
+                        enthalpy[i+1, j_target] += moved * h_spec
+                elif surf[i+1] > surf[i]:
+                    j_top = surf[i+1]
+                    j_target = surf[i]
+                    if T[i+1, j_top] > T_soft:
+                        moved = mass[i+1, j_top] * 0.5
+                        h_spec = enthalpy[i+1, j_top] / max(1e-6, mass[i+1, j_top])
+                        mass[i+1, j_top] -= moved; mass[i, j_target] += moved
+                        enthalpy[i+1, j_top] -= moved * h_spec
+                        enthalpy[i, j_target] += moved * h_spec
 
         # 8. Wall Heat Loss
         for j in range(N_z):
