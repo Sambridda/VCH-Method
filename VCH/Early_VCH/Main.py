@@ -14,6 +14,7 @@ import multiprocessing
 
 import engine_1d
 import engine_2d
+import outputs
 
 # ============================================================
 # WATER REFERENCE TABLE
@@ -258,7 +259,7 @@ def build_material_tables(cfg):
     return dict(T_grid=T_grid, H_grid=H_grid, rho_grid=rho_grid, cp_sens_grid=cp_sens_grid, k_grid=k_grid, mu_grid=mu_grid)
 
 # ------------------------------------------------------------
-# PLOTTING & HTML
+# PLOTTING & HTML (Phase A only)
 # ------------------------------------------------------------
 def write_csv(rows, path, cfg):
     if not rows: return
@@ -285,181 +286,6 @@ def plot_cold(rows, T_amb, out_path, t_window_hr, preset_label):
     ax1.legend(fontsize=7, ncol=3, loc="upper left"); ax1.grid(True, alpha=0.3)
     ax2.set_xlabel("Coil length (m)"); ax2.set_ylabel("Avg T (degC)"); ax2.legend(fontsize=6, ncol=3, loc="best"); ax2.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
-
-def _html_table(rows):
-    return "<table>\n" + "\n".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows) + "\n</table>"
-
-def _html_prop_arrays(name, T_arr, props):
-    h = [f"<h3>{name} — properties at [{', '.join(f'{t:.1f}' for t in T_arr)}] degC</h3>", "<table><tr><th>Property</th>" + "".join(f"<th>{t:.1f} °C</th>" for t in T_arr) + "</tr>"]
-    for label, vals, unit in props:
-        h.append(f"<tr><td>{label}</td>" + "".join(f"<td>{v:g} {unit}</td>" for v in vals) + "</tr>")
-    return "\n".join(h) + "\n</table>"
-
-def _render_timeline(status_log, dt_sec, max_bins=400):
-    if status_log is None: return "<p style='color:#888;'>Timeline not available.</p>"
-    n = len(status_log)
-    if n == 0: return "<p style='color:#888;'>No timeline data.</p>"
-    if dt_sec is None or dt_sec <= 0: return "<p style='color:#888;'>Timeline dt unknown.</p>"
-    total_dur = n * dt_sec / 3600.0
-
-    if n > max_bins:
-        bin_size = (n + max_bins - 1) // max_bins
-        bins = []
-        for b in range(0, n, bin_size):
-            chunk = status_log[b:b + bin_size]
-            if np.any(chunk == -1): st = -1
-            elif np.any(chunk == 3): st = 3
-            elif np.any(chunk == 1): st = 1
-            elif np.any(chunk == 2): st = 2
-            else: st = 0
-            if bins and bins[-1][0] == st: bins[-1][1] += 1
-            else: bins.append([st, 1])
-        step_dur = bin_size * dt_sec / 3600.0
-    else:
-        bins = []
-        for s in status_log:
-            st = int(s)
-            if bins and bins[-1][0] == st: bins[-1][1] += 1
-            else: bins.append([st, 1])
-        step_dur = dt_sec / 3600.0
-
-    colors = {0: "#f39c12", 1: "#2ecc71", 2: "#3498db", 3: "#9b59b6", -1: "#95a5a6"}
-    labels = {0: "Heating (Idle)", 1: "Draining", 2: "Filling", 3: "Drain + Fill", -1: "Cooling"}
-    parts = []
-    for st, cnt in bins:
-        dur = cnt * step_dur
-        if dur <= 0: continue
-        parts.append(f'<div style="flex: {dur:.6f} 0 0; background:{colors.get(st, "#ccc")};" title="{labels.get(st, "?")} — {dur:.2f} h"></div>')
-    
-    legend = " &nbsp;&nbsp; ".join(
-        f'<span style="display:inline-block; width:14px; height:14px; background:{colors[s]}; border-radius:2px; vertical-align:middle;"></span> {labels[s]}'
-        for s in (3, 1, 2, 0, -1))
-    return ('<div style="display:flex; width:100%; height:28px; border:1px solid #ccc; border-radius:4px; overflow:hidden; margin:8px 0;">'
-            + "".join(parts) +
-            "</div>"
-            + f'<div style="font-size:12px; color:#555; margin-bottom:16px;">' + legend + f' &nbsp; (total {total_dur:.2f} h)</div>')
-
-def write_report_html(outdir, cfg, R_ag, n_ag, results_2d=None):
-    mat = cfg["_mat"]; L_coil = 2.0*np.pi*R_ag*n_ag; A_coil = np.pi*cfg["d_out"]*L_coil
-    rho_tube_ref = float(np.interp(cfg["T_water_in"], cfg["T_tube_arr"], cfg["rho_tube_arr"]))
-    M_metal = rho_tube_ref * np.pi*0.25*(cfg["d_out"]**2 - cfg["d_in"]**2)*L_coil
-    rho_water_ref = float(np.interp(cfg["T_water_in"], cfg["T_water_arr"], cfg["rho_water_arr"]))
-    V_water = np.pi*0.25*cfg["d_in"]**2*L_coil; M_water = rho_water_ref * V_water
-
-    T_start_str = f"{cfg['T_start']:.1f} °C" if 'T_start' in cfg else "n/a"
-    M_eff_str = f"{cfg.get('M_fluid_effective', cfg['M_fluid']):.0f} kg"
-
-    h = ["<!doctype html><html><head><meta charset='utf-8'><title>Tank Report</title>",
-         "<style>body{font-family:sans-serif;max-width:1150px;margin:20px auto;color:#222}",
-         "h1{border-bottom:2px solid #333;padding-bottom:6px} h2{margin-top:32px;color:#1a4d7a;border-bottom:1px solid #ddd;padding-bottom:4px}",
-         "h3{margin-top:20px;color:#333;font-size:16px;} h4{margin:4px 0; font-size:14px; color:#555;}",
-         "table{border-collapse:collapse;margin:8px 0 12px 0;font-size:13px} td,th{border:1px solid #ccc;padding:5px 8px;text-align:right}",
-         "th{background:#eef4fa;text-align:center} td:first-child{text-align:left;font-weight:500}",
-         ".banner{background:#1a4d7a; color:white; padding:12px; border-radius:4px; font-size:16px; margin-bottom:20px}",
-         "img{max-width:100%;margin:12px 0;border:1px solid #ddd}",
-         ".imgrow{display:flex; gap:12px; flex-wrap:wrap; align-items:flex-start; margin:8px 0;}",
-         ".imgrow > div{flex:1 1 320px; min-width:280px;}",
-         ".imgrow img{margin:4px 0;}",
-         ".nodrain{color:#888; font-style:italic;}</style></head><body>",
-         "<h1>Selected Coil — Detailed Report</h1>",
-         f"<div class='banner'><b>Materials:</b> Coil Fluid={cfg['fluid_name']} | Tank Fluid={cfg['tank_name']} | Tube={cfg['coil_mat']} | Wall={cfg['wall_name']}</div>",
-         f"<p><em>Run: {os.path.basename(outdir)}</em></p>"]
-
-    h.append("<h2>1. Input Parameters</h2>")
-    h.append(f"<h3>Coil Fluid: {cfg['fluid_name']}</h3>" + _html_prop_arrays("Coil", cfg["T_water_arr"], [("Density", cfg["rho_water_arr"], "kg/m³"), ("Cp", cfg["cp_water_arr"], "J/kgK"), ("Mu", cfg["mu_water_arr"], "Pa·s"), ("k", cfg["k_water_arr"], "W/mK")]))
-    h.append(f"<h3>Tank Fluid: {cfg['tank_name']}</h3>" + _html_prop_arrays("Solid", cfg["T_solid_arr"], [("Density", cfg["rho_solid_arr"], "kg/m³"), ("Cp", cfg["cp_solid_arr"], "J/kgK"), ("k", cfg["k_solid_arr"], "W/mK"), ("Mu", cfg["mu_solid_arr"], "Pa·s")]))
-    h.append(_html_prop_arrays("Liquid", cfg["T_liquid_arr"], [("Density", cfg["rho_liquid_arr"], "kg/m³"), ("Cp", cfg["cp_liquid_arr"], "J/kgK"), ("k", cfg["k_liquid_arr"], "W/mK"), ("Mu", cfg["mu_liquid_arr"], "Pa·s")]))
-
-    h.append("<h3>Geometry & Operating</h3>" + _html_table([
-        ("Inner radius", f"{cfg['r_inner']:.4f} m"),
-        ("Fluid mass (requested)", f"{cfg['M_fluid']:.0f} kg"),
-        ("Starting tank temperature", T_start_str),
-        ("Effective mass at T_start", M_eff_str),
-        ("Environment (for heat loss)", f"{cfg['T_amb_mid']:.1f} °C"),
-        ("Wall", f"{cfg['wall_name']}, t={cfg['t_wall']*1000:.1f} mm"),
-        ("Insulation", f"t={cfg['t_ins']*1000:.0f} mm, U={cfg['h_air']:.1f} W/m²K"),
-        ("Agitator", f"Type {cfg['ag_type']} @ {cfg['N_rpm']} RPM" if cfg['has_agitator'] else "None"),
-        ("Windows", f"Heating {cfg['t_window_hr']:.2f} h, Cooldown {cfg['t_cooldown_hr']:.2f} h"),
-        ("Cycles", f"{cfg['N_cycles']}")
-    ]))
-
-    h.append("<h2>2. Selected Coil Geometry</h2>" + _html_table([
-        ("Radius R", f"{R_ag:.4f} m"), ("Turns n", f"{n_ag}"), ("Developed length L", f"{L_coil:.2f} m"),
-        ("Outer area A", f"{A_coil:.2f} m²"), ("Metal mass", f"{M_metal:.1f} kg"), ("Water volume", f"{V_water*1000:.1f} L")
-    ]))
-
-    if results_2d is not None:
-        h.append("<h2>3. Simulation Results</h2>")
-        h.append(f"<p><b>Total Simulation Time:</b> {results_2d['total_hr']:.1f} h</p>")
-
-        h.append("<h2>Panel 1 — Cycle Details</h2>")
-        n_cycles_metrics = len(results_2d["cycle_metrics"])
-        for idx in range(n_cycles_metrics):
-            m = results_2d["cycle_metrics"][idx]
-            hm = os.path.basename(results_2d["heatmap_paths"][idx])
-            mm = os.path.basename(results_2d["massmap_paths"][idx])
-            tm = os.path.basename(results_2d["topmass_paths"][idx])
-            tt = os.path.basename(results_2d["toptemp_paths"][idx])
-            pb = os.path.basename(results_2d["phasebar_paths"][idx])
-            
-            h.append(f"<h3>Cycle {m['cycle']}</h3>")
-            
-            h.append("<div class='imgrow'>"
-                     f"<div><h4>Lateral Temperature</h4><img src='{hm}' alt='heatmap_{idx}'></div>"
-                     f"<div><h4>Lateral Mass Distribution</h4><img src='{mm}' alt='massmap_{idx}'></div>"
-                     "</div>")
-                     
-            h.append("<div class='imgrow'>"
-                     f"<div><h4>Top-Down Column Density</h4><img src='{tm}' alt='topmass_{idx}'></div>"
-                     f"<div><h4>Top-Down Surface Temperature</h4><img src='{tt}' alt='toptemp_{idx}'></div>"
-                     "</div>")
-                     
-            h.append("<div class='imgrow'>"
-                     f"<div><h4>Phase Distribution</h4><img src='{pb}' alt='phasebar_{idx}'></div>"
-                     "</div>")
-                     
-            if m["extracted_kg"] > 1e-6:
-                temp_str = f"{m['extracted_temp_avg']:.1f} °C"
-            else:
-                temp_str = "<span class='nodrain'>—</span>"
-                
-            h.append("<table>")
-            h.append(f"<tr><td>Fluid in tank (start of heating)</td><td>{m['start_mass']:.1f} kg</td></tr>")
-            h.append(f"<tr><td>Fluid in tank (end of heating)</td><td>{m['remaining_mass']:.1f} kg</td></tr>")
-            h.append(f"<tr><td>Fluid extracted via drain</td><td>{m['extracted_kg']:.1f} kg</td></tr>")
-            h.append(f"<tr><td>Average extracted temperature</td><td>{temp_str}</td></tr>")
-            h.append(f"<tr><td>Drain efficiency</td><td>{m['efficiency_pct']:.1f} %</td></tr>")
-            h.append(f"<tr><td>Drain utilisation</td><td>{m['utilisation_pct']:.1f} %</td></tr>")
-            h.append(f"<tr><td>Fluid added via fill</td><td>{m['filled_kg']:.1f} kg</td></tr>")
-            h.append(f"<tr><td>Fill utilisation</td><td>{m['fill_util_pct']:.1f} %</td></tr>")
-            h.append("</table>")
-
-        h.append("<h2>Panel 2 — Final Summary</h2>")
-        h.append("<h3>Mass Flow Curve (Drain & Fill)</h3>")
-        h.append(f"<img src='{os.path.basename(results_2d['curve_path'])}' alt='curve'>")
-        h.append("<h3>Timeline</h3>")
-        h.append(_render_timeline(results_2d.get("status_log"), results_2d.get("dt_sec")))
-
-        first_t = f"{results_2d['first_drain']:.2f} h" if results_2d['first_drain'] >= 0 else "Never"
-        if results_2d['last_drain'] < 0:
-            last_t = "Never"
-        elif results_2d['last_drain'] >= results_2d['total_hr'] - 0.01:
-            last_t = f"{results_2d['last_drain']:.2f} h (Ongoing)"
-        else:
-            last_t = f"{results_2d['last_drain']:.2f} h"
-
-        h.append("<h3>Drain Summary</h3>")
-        h.append("<table>")
-        h.append(f"<tr><td>First drain activated</td><td>{first_t}</td></tr>")
-        h.append(f"<tr><td>Drain stopped completely</td><td>{last_t}</td></tr>")
-        h.append(f"<tr><td>Total Drained</td><td>{results_2d['total_extracted_kg']:.1f} kg</td></tr>")
-        h.append(f"<tr><td>Total Filled</td><td>{results_2d['total_filled_kg']:.1f} kg</td></tr>")
-        h.append(f"<tr><td>Total Remaining</td><td>{results_2d['final_mass']:.1f} kg</td></tr>")
-        h.append("</table>")
-
-    h.append("</body></html>")
-    with open(os.path.join(outdir, "index.html"), "w", encoding="utf-8") as f:
-        f.write("\n".join(h))
 
 # ------------------------------------------------------------
 # MAIN ORCHESTRATOR
@@ -560,9 +386,13 @@ def main():
     if cfg["simulate_drain"]:
         cfg["drain_diameter"] = pf("    Drain valve diameter (m)", default=0.05, lo=0.001, hi=1.0)
         cfg["drain_r_idx"] = pi_prompt("    Drain radial index (0=center, 49=wall)", default=0, lo=0, hi=49)
+        if cfg["drain_r_idx"] > 0:
+            cfg["drain_angle"] = pf("    Drain angular position (0-360 deg, clockwise from top)", default=0.0, lo=0.0, hi=360.0)
+        else:
+            cfg["drain_angle"] = 0.0
         cfg["drain_z_idx"] = pi_prompt("    Drain axial index (0=bottom, 49=top)", default=0, lo=0, hi=49)
     else:
-        cfg["drain_diameter"] = 0.0; cfg["drain_r_idx"] = 0; cfg["drain_z_idx"] = 0
+        cfg["drain_diameter"] = 0.0; cfg["drain_r_idx"] = 0; cfg["drain_z_idx"] = 0; cfg["drain_angle"] = 0.0
 
     print("\n--- 2D Fill Setup ---")
     cfg["simulate_fill"] = input("  Do you want to simulate continuous filling? [y/N]: ").strip().lower() in ("y", "yes")
@@ -571,11 +401,15 @@ def main():
         cfg["fill_flow_m3h"] = pf("    Fill volumetric flow rate (m3/h)", default=1.0, lo=0.01, hi=100.0)
         cfg["fill_T"] = pf("    Fill fluid temperature degC", default=cfg["T_amb_mid"])
         cfg["fill_r_idx"] = pi_prompt("    Fill radial index (0=center, 49=wall)", default=0, lo=0, hi=49)
+        if cfg["fill_r_idx"] > 0:
+            cfg["fill_angle"] = pf("    Fill angular position (0-360 deg, clockwise from top)", default=0.0, lo=0.0, hi=360.0)
+        else:
+            cfg["fill_angle"] = 0.0
         cfg["fill_z_idx"] = pi_prompt("    Fill axial index (0=bottom, 49=top)", default=49, lo=0, hi=49)
         fill_menu = [("0", "Constant (all phases)"), ("1", "Heating phases only"), ("2", "Cooling phases only")]
         cfg["fill_mode"] = int(pc("    Fill behaviour:", fill_menu))
     else:
-        cfg["fill_diameter"] = 0.0; cfg["fill_flow_m3h"] = 0.0; cfg["fill_T"] = cfg["T_amb_mid"]; cfg["fill_r_idx"] = 0; cfg["fill_z_idx"] = 49; cfg["fill_mode"] = 0
+        cfg["fill_diameter"] = 0.0; cfg["fill_flow_m3h"] = 0.0; cfg["fill_T"] = cfg["T_amb_mid"]; cfg["fill_r_idx"] = 0; cfg["fill_z_idx"] = 49; cfg["fill_mode"] = 0; cfg["fill_angle"] = 0.0
 
     # --- PHASE D: THE 2D SIMULATION ---
     print("\n" + "="*70)
@@ -587,14 +421,6 @@ def main():
         cfg["drain_diameter"], (cfg["drain_r_idx"], cfg["drain_z_idx"]), 
         outdir
     )
-
-    print("\n--- 2D SIMULATION RESULTS ---")
-    for m in results_2d["cycle_metrics"]:
-        temp_part = f", ExtractedT={m['extracted_temp_avg']:.1f} C" if m['extracted_kg'] > 1e-6 else ""
-        print(f"  Cycle {m['cycle']}: Extracted={m['extracted_kg']:.1f} kg, Filled={m['filled_kg']:.1f} kg{temp_part}, "
-              f"Drain Util={m['utilisation_pct']:.1f}%, Fill Util={m['fill_util_pct']:.1f}%")
-
-    write_report_html(outdir, cfg, R_ag, n_ag, results_2d)
 
     print("\n" + "="*70 + "\n DONE\n" + "="*70)
     print(f"  {outdir}/index.html")

@@ -3,12 +3,9 @@
 # ============================================================
 import numpy as np
 from numba import njit, objmode
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 import os
 import sys
+import outputs
 
 # ------------------------------------------------------------
 # 1D NTU HEAT TRANSFER FUNCTIONS
@@ -80,49 +77,44 @@ def calc_Q(m_dot, T_band, T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actua
     return eps * m_dot * cp_c * (T_water_in - T_band)
 
 # ------------------------------------------------------------
-# THE 2D KERNEL
+# CYCLE KERNEL (Physics for ONE cycle)
 # ------------------------------------------------------------
 @njit(cache=True)
-def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz, 
-              coil_w, R_coil, A_coil_total, d_in, d_out, R_f_out, m_dot_coil,
-              drain_r, drain_z, drain_area,
-              fill_w, fill_theta_frac, fill_z, fill_mdot, fill_T, fill_mode,
-              T_water_in, T_ms, T_me, Hfus,
-              T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid,
-              T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
-              T_tube_arr, k_tube_arr, 
-              dt, n_steps, n_steps_heat, n_steps_cool, n_cycles, T_amb, U_tank_air,
-              K_settle,
-              has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
+def cycle_kernel(
+        mass, enthalpy, N_r, N_z, dr, dz, 
+        coil_w, R_coil, A_coil_total, d_in, d_out, R_f_out, m_dot_coil,
+        drain_r, drain_z, drain_area,
+        fill_w, fill_theta_frac, fill_z, fill_mdot, fill_T, fill_mode,
+        T_water_in, T_ms, T_me, Hfus,
+        T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid,
+        T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
+        T_tube_arr, k_tube_arr, 
+        dt, n_steps_heat, n_steps_cool, do_cool, n_cycles, T_amb, U_tank_air,
+        K_settle, has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural,
+        drained_mass_cum_in, filled_mass_cum_in, idle_time_in,
+        first_drain_time_in, last_drain_time_in, stranded_prev_in,
+        snapshot_interval_steps):
     
-    drained_mass_cum = 0.0
-    filled_mass_cum = 0.0
-    idle_time = 0.0
+    n_steps = n_steps_heat + (n_steps_cool if do_cool else 0)
+    
+    time_log = np.zeros(n_steps)
     drain_log = np.zeros(n_steps)
     fill_log = np.zeros(n_steps)
-    time_log = np.zeros(n_steps)
-    is_heating_log = np.zeros(n_steps, dtype=np.bool_)
     status_log = np.zeros(n_steps, dtype=np.int8)
+    is_heating_log = np.zeros(n_steps, dtype=np.bool_)
     
-    cycle_extracted = np.zeros(n_cycles)
-    cycle_filled = np.zeros(n_cycles)
-    cycle_idle_hr = np.zeros(n_cycles)
-    cycle_produced = np.zeros(n_cycles)
-    cycle_stranded = np.zeros(n_cycles)
-    cycle_start_mass = np.zeros(n_cycles)
-    cycle_remaining_mass = np.zeros(n_cycles)
+    drained_mass_cum = drained_mass_cum_in
+    filled_mass_cum = filled_mass_cum_in
+    idle_time = idle_time_in
+    first_drain_time = first_drain_time_in
+    last_drain_time = last_drain_time_in
+    stranded_prev = stranded_prev_in
     
-    cyc_sol_kg = np.zeros(n_cycles); cyc_sol_T = np.zeros(n_cycles)
-    cyc_slu_kg = np.zeros(n_cycles); cyc_slu_T = np.zeros(n_cycles)
-    cyc_liq_kg = np.zeros(n_cycles); cyc_liq_T = np.zeros(n_cycles)
-    
-    cycle_extracted_temp_sum = np.zeros(n_cycles)
-    
-    first_drain_time = -1.0
-    last_drain_time = -1.0
-    
-    T_snapshots = np.full((n_cycles, N_r, N_z), np.nan)
-    M_snapshots = np.full((n_cycles, N_r, N_z), np.nan)
+    max_snaps = (n_steps // snapshot_interval_steps) + 2
+    T_snapshots = np.full((max_snaps, N_r, N_z), np.nan)
+    M_snapshots = np.full((max_snaps, N_r, N_z), np.nan)
+    snapshot_times = np.zeros(max_snaps)
+    snap_count = 0
     
     V_cell = np.empty((N_r, N_z))
     for i in range(N_r):
@@ -130,37 +122,23 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         for j in range(N_z):
             V_cell[i, j] = np.pi * (r_out**2 - r_in**2) * dz
             
-    cycle_len = max(1, n_steps_heat + n_steps_cool)
     T_soft = T_ms - 10.0 
-
-    stranded_prev = 0.0
-    for i in range(N_r):
-        for j in range(N_z):
-            if mass[i, j] > 1e-6:
-                T_curr = np.interp(enthalpy[i, j] / mass[i, j], H_grid, T_grid)
-                if T_curr > T_me:
-                    stranded_prev += mass[i, j]
-
-    extracted_so_far = 0.0
-    filled_so_far = 0.0
-    idle_so_far = 0.0
+    
+    cycle_start_mass = np.sum(mass)
+    cycle_extracted_temp_sum = 0.0
+    m_sol = 0.0; T_sol_sum = 0.0
+    m_slu = 0.0; T_slu_sum = 0.0
+    m_liq = 0.0; T_liq_sum = 0.0
+    liquid_now = 0.0
+    cycle_extracted = 0.0
+    cycle_filled = 0.0
+    cycle_idle_hr = 0.0
+    cycle_remaining_mass = 0.0
 
     for step in range(n_steps):
-        if step % 1000 == 0 or step == n_steps - 1:
-            with objmode():
-                pct = (step / max(1, n_steps)) * 100.0
-                sys.stdout.write("\r  2D Simulating... %.1f%% " % pct)
-                sys.stdout.flush()
-
         time_log[step] = step * dt / 3600.0
-        
-        step_in_cycle = step % cycle_len
-        cycle_idx = step // cycle_len
-        is_heating = (step_in_cycle < n_steps_heat)
+        is_heating = (step < n_steps_heat)
         is_heating_log[step] = is_heating
-        
-        if step_in_cycle == 0:
-            cycle_start_mass[cycle_idx] = np.sum(mass)
 
         T = np.zeros((N_r, N_z))
         for i in range(N_r):
@@ -186,7 +164,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     if coil_w[i, j] > 1e-6 and mass[i, j] > 1e-6:
                         T_coil_avg += T[i, j] * coil_w[i, j]
                         weight_sum += coil_w[i, j]
-                        
             if weight_sum > 0.0:
                 T_coil_avg /= weight_sum
                 d_coil_actual = 2.0 * R_coil
@@ -194,7 +171,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                                  T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
                                  T_tube_arr, k_tube_arr, T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
                                  has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural)
-                
                 for i in range(N_r):
                     for j in range(N_z):
                         if coil_w[i, j] > 1e-6 and mass[i, j] > 1e-6:
@@ -205,7 +181,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
             for j in range(N_z):
                 if mass[i, j] <= 1e-6: continue
                 k_here = np.interp(T[i, j], T_grid, k_grid)
-                
                 if i > 0 and mass[i-1, j] > 1e-6:
                     k_avg = 0.5 * (k_here + np.interp(T[i-1, j], T_grid, k_grid))
                     area = 2.0 * np.pi * (i * dr) * dz
@@ -216,7 +191,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     area = 2.0 * np.pi * ((i+1) * dr) * dz
                     q = k_avg * area * (T[i, j] - T[i+1, j]) / dr
                     enthalpy[i, j] -= q * dt
-                    
                 if j > 0 and mass[i, j-1] > 1e-6:
                     k_avg = 0.5 * (k_here + np.interp(T[i, j-1], T_grid, k_grid))
                     if T[i, j-1] > T[i, j]: k_avg *= 50.0
@@ -230,7 +204,7 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     q = k_avg * area * (T[i, j] - T[i, j+1]) / dz
                     enthalpy[i, j] -= q * dt
 
-        # 4. Draining — pull ONLY from the drain cell
+        # 4. Draining
         drained_this_step = 0.0
         if is_heating and drain_area > 0.0:
             if mass[drain_r, drain_z] > 1e-6 and T[drain_r, drain_z] > T_ms:
@@ -239,14 +213,11 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     if mass[drain_r, j] > 1e-6 and T[drain_r, j] > T_ms:
                         surf_drain = j
                         break
-                
                 h_head = max((surf_drain - drain_z) * dz, 0.01)
                 rho_liq = np.interp(T[drain_r, drain_z], T_grid, rho_grid)
                 v_flow = 0.6 * np.sqrt(2.0 * 9.81 * h_head)
                 target_mass = rho_liq * v_flow * drain_area * dt
-                
                 actual_dm = min(target_mass, mass[drain_r, drain_z])
-                
                 if actual_dm > 0.0:
                     h_spec = enthalpy[drain_r, drain_z] / max(1e-6, mass[drain_r, drain_z])
                     T_ext = T[drain_r, drain_z]
@@ -254,41 +225,30 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     enthalpy[drain_r, drain_z] -= actual_dm * h_spec
                     drained_mass_cum += actual_dm
                     drained_this_step += actual_dm
-                    cycle_extracted_temp_sum[cycle_idx] += actual_dm * T_ext
-                    if first_drain_time < 0:
-                        first_drain_time = time_log[step]
+                    cycle_extracted_temp_sum += actual_dm * T_ext
+                    if first_drain_time < 0: first_drain_time = time_log[step]
                     last_drain_time = time_log[step]
 
         did_drain = drained_this_step > 0.0
 
-        # ============================================================
-        # 5. Filling (3D Localized Source)
-        # ============================================================
+        # 5. Filling
         filled_this_step = 0.0
         can_fill = False
         if fill_mdot > 0.0:
             if fill_mode == 0: can_fill = True
             elif fill_mode == 1: can_fill = is_heating
             elif fill_mode == 2: can_fill = not is_heating
-            
         if can_fill:
             rho_fill = np.interp(fill_T, T_grid, rho_grid)
             h_fill = np.interp(fill_T, T_grid, H_grid)
             target_mass = fill_mdot * dt
-            
-            # Distribute the target mass across the footprint weights
             for i in range(N_r):
                 if fill_w[i] > 0.0:
-                    # Target mass for this specific cell in the footprint
                     target_here = target_mass * fill_w[i]
-                    
-                    # 3D localized capacity (what the nozzle "sees")
                     cap_local = V_cell[i, fill_z] * rho_fill * fill_theta_frac[i]
                     current_local = mass[i, fill_z] * fill_theta_frac[i]
                     available_space = cap_local - current_local
-                    
                     actual_fill = min(target_here, available_space)
-                    
                     if actual_fill > 0.0:
                         mass[i, fill_z] += actual_fill
                         enthalpy[i, fill_z] += actual_fill * h_fill
@@ -302,7 +262,6 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
         drain_log[step] = drained_mass_cum
         fill_log[step] = filled_mass_cum
 
-        # Refresh surfaces post-drain/fill
         for i in range(N_r):
             surf[i] = 0
             for j in range(N_z - 1, -1, -1):
@@ -310,50 +269,39 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     surf[i] = j
                     break
 
-        # 6. Vertical Fluid Flow (Gravity & Thermal Expansion)
-        # 6a. Downward Collapse
+        # 6. Vertical Flow
         for j in range(0, N_z - 1):
             for i in range(N_r):
-                if mass[i, j+1] <= 1e-6:
-                    continue
+                if mass[i, j+1] <= 1e-6: continue
                 T_src = T[i, j+1]
                 rho_src = np.interp(T_src, T_grid, rho_grid)
                 cap_mass = V_cell[i, j] * rho_src
                 needed = cap_mass - mass[i, j]
-                if needed <= 1e-9:
-                    continue
-
+                if needed <= 1e-9: continue
                 h_head = (surf[i] - j) * dz
                 mu_above = np.interp(T_src, T_grid, mu_grid)
-
                 mobility = (K_settle * h_head) / max(1e-6, mu_above)
                 mobility = min(1.0, max(0.01, mobility))
-
                 moved = min(needed * mobility, mass[i, j+1])
-
                 if moved > 1e-9:
                     h_spec = enthalpy[i, j+1] / max(1e-6, mass[i, j+1])
                     mass[i, j] += moved; mass[i, j+1] -= moved
                     enthalpy[i, j] += moved * h_spec
                     enthalpy[i, j+1] -= moved * h_spec
 
-        # 6b. Upward Expansion
         for j in range(N_z - 2, -1, -1):
             for i in range(N_r):
-                if mass[i, j] <= 1e-6:
-                    continue
+                if mass[i, j] <= 1e-6: continue
                 rho_here = np.interp(T[i, j], T_grid, rho_grid)
                 cap_mass = V_cell[i, j] * rho_here
                 excess = mass[i, j] - cap_mass
-                
                 if excess > 1e-9:
                     h_spec = enthalpy[i, j] / max(1e-6, mass[i, j])
-                    mass[i, j] -= excess
-                    mass[i, j+1] += excess
+                    mass[i, j] -= excess; mass[i, j+1] += excess
                     enthalpy[i, j] -= excess * h_spec
                     enthalpy[i, j+1] += excess * h_spec
 
-        # 7. Radial Pressure-Driven Flow (cell-by-cell)
+        # 7. Radial Flow
         eff_height = np.zeros(N_r)
         for i in range(N_r):
             area_i = V_cell[i, 0] / dz
@@ -366,30 +314,22 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                 eff_height[i] = vol_col / area_i
         
         for i in range(N_r - 1):
-            if eff_height[i] - eff_height[i+1] <= 1e-4:
-                continue
+            if eff_height[i] - eff_height[i+1] <= 1e-4: continue
             for j in range(N_z):
-                if mass[i, j] <= 1e-6:
-                    continue
+                if mass[i, j] <= 1e-6: continue
                 j_mid = (j + 0.5) * dz
                 p_here = eff_height[i] - j_mid
                 p_next = eff_height[i+1] - j_mid
-                if p_here <= 0.0 or p_here <= p_next:
-                    continue
+                if p_here <= 0.0 or p_here <= p_next: continue
                 local_dh = p_here - max(0.0, p_next)
-                if local_dh <= 1e-6:
-                    continue
-                
+                if local_dh <= 1e-6: continue
                 rho_j = np.interp(T[i, j], T_grid, rho_grid)
                 cap = V_cell[i+1, j] * rho_j
                 needed = cap - mass[i+1, j]
-                if needed <= 1e-9:
-                    continue
-                
+                if needed <= 1e-9: continue
                 mu_j = np.interp(T[i, j], T_grid, mu_grid)
                 mobility = (K_settle * local_dh) / max(1e-6, mu_j)
                 mobility = min(1.0, max(0.01, mobility))
-                
                 moved = min(mass[i, j] * mobility * 0.5, needed)
                 if moved > 1e-9:
                     h_spec = enthalpy[i, j] / max(1e-6, mass[i, j])
@@ -398,30 +338,22 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     enthalpy[i+1, j] += moved * h_spec
         
         for i in range(N_r - 2, -1, -1):
-            if eff_height[i+1] - eff_height[i] <= 1e-4:
-                continue
+            if eff_height[i+1] - eff_height[i] <= 1e-4: continue
             for j in range(N_z):
-                if mass[i+1, j] <= 1e-6:
-                    continue
+                if mass[i+1, j] <= 1e-6: continue
                 j_mid = (j + 0.5) * dz
                 p_here = eff_height[i+1] - j_mid
                 p_prev = eff_height[i] - j_mid
-                if p_here <= 0.0 or p_here <= p_prev:
-                    continue
+                if p_here <= 0.0 or p_here <= p_prev: continue
                 local_dh = p_here - max(0.0, p_prev)
-                if local_dh <= 1e-6:
-                    continue
-                
+                if local_dh <= 1e-6: continue
                 rho_j = np.interp(T[i+1, j], T_grid, rho_grid)
                 cap = V_cell[i, j] * rho_j
                 needed = cap - mass[i, j]
-                if needed <= 1e-9:
-                    continue
-                
+                if needed <= 1e-9: continue
                 mu_j = np.interp(T[i+1, j], T_grid, mu_grid)
                 mobility = (K_settle * local_dh) / max(1e-6, mu_j)
                 mobility = min(1.0, max(0.01, mobility))
-                
                 moved = min(mass[i+1, j] * mobility * 0.5, needed)
                 if moved > 1e-9:
                     h_spec = enthalpy[i+1, j] / max(1e-6, mass[i+1, j])
@@ -429,82 +361,69 @@ def kernel_2d(mass, enthalpy, N_r, N_z, dr, dz,
                     enthalpy[i+1, j] -= moved * h_spec
                     enthalpy[i, j] += moved * h_spec
 
-        # 8. Wall Heat Loss
+        # 8. Wall Loss
         for j in range(N_z):
             if mass[N_r-1, j] > 1e-6:
                 area = 2.0 * np.pi * ((N_r - 1) * dr) * dz
                 q_loss = U_tank_air * area * (T[N_r-1, j] - T_amb)
                 enthalpy[N_r-1, j] -= q_loss * dt
 
-        # Status Log: 0=idle, 1=drain, 2=fill, 3=both, -1=cooling
-        if not is_heating:
-            status_log[step] = -1
-        elif did_drain and did_fill:
-            status_log[step] = 3
-        elif did_drain:
-            status_log[step] = 1
-        elif did_fill:
-            status_log[step] = 2
-        else:
-            status_log[step] = 0
+        if not is_heating: status_log[step] = -1
+        elif did_drain and did_fill: status_log[step] = 3
+        elif did_drain: status_log[step] = 1
+        elif did_fill: status_log[step] = 2
+        else: status_log[step] = 0
 
-        if is_heating and (step_in_cycle == n_steps_heat - 1):
-            for i in range(N_r):
-                for j in range(N_z):
-                    if mass[i, j] <= 1e-6:
-                        T_snapshots[cycle_idx, i, j] = np.nan
-                        M_snapshots[cycle_idx, i, j] = np.nan
-                    else:
-                        T_snapshots[cycle_idx, i, j] = T[i, j]
-                        M_snapshots[cycle_idx, i, j] = mass[i, j]
+        # Capture Snapshots (Hourly + End of Heating)
+        if (step % snapshot_interval_steps == 0) or (is_heating and step == n_steps_heat - 1):
+            if snap_count < max_snaps:
+                if snap_count > 0 and abs(snapshot_times[snap_count-1] - time_log[step]) < 1e-4:
+                    pass
+                else:
+                    for i in range(N_r):
+                        for j in range(N_z):
+                            if mass[i, j] <= 1e-6:
+                                T_snapshots[snap_count, i, j] = np.nan
+                                M_snapshots[snap_count, i, j] = np.nan
+                            else:
+                                T_snapshots[snap_count, i, j] = T[i, j]
+                                M_snapshots[snap_count, i, j] = mass[i, j]
+                    snapshot_times[snap_count] = time_log[step]
+                    snap_count += 1
             
-            liquid_now = 0.0
-            for i in range(N_r):
-                for j in range(N_z):
-                    if T[i, j] > T_me:
-                        liquid_now += mass[i, j]
-            
-            cycle_stranded[cycle_idx] = liquid_now
-            cycle_extracted[cycle_idx] = drained_mass_cum - extracted_so_far
-            cycle_filled[cycle_idx] = filled_mass_cum - filled_so_far
-            cycle_idle_hr[cycle_idx] = idle_time - idle_so_far
-            cycle_produced[cycle_idx] = cycle_extracted[cycle_idx] + (liquid_now - stranded_prev)
-            cycle_remaining_mass[cycle_idx] = np.sum(mass)
-            
-            extracted_so_far = drained_mass_cum
-            filled_so_far = filled_mass_cum
-            idle_so_far = idle_time
-            stranded_prev = liquid_now
+            if is_heating and step == n_steps_heat - 1:
+                liquid_now = 0.0
+                for i in range(N_r):
+                    for j in range(N_z):
+                        if T[i, j] > T_me:
+                            liquid_now += mass[i, j]
+                
+                cycle_remaining_mass = np.sum(mass)
+                
+                for i in range(N_r):
+                    for j in range(N_z):
+                        if mass[i, j] > 1e-6:
+                            if T[i, j] < T_ms:
+                                m_sol += mass[i, j]; T_sol_sum += mass[i, j] * T[i, j]
+                            elif T[i, j] <= T_me:
+                                m_slu += mass[i, j]; T_slu_sum += mass[i, j] * T[i, j]
+                            else:
+                                m_liq += mass[i, j]; T_liq_sum += mass[i, j] * T[i, j]
 
-            m_sol = 0.0; T_sol_sum = 0.0
-            m_slu = 0.0; T_slu_sum = 0.0
-            m_liq = 0.0; T_liq_sum = 0.0
-            for i in range(N_r):
-                for j in range(N_z):
-                    if mass[i, j] > 1e-6:
-                        if T[i, j] < T_ms:
-                            m_sol += mass[i, j]; T_sol_sum += mass[i, j] * T[i, j]
-                        elif T[i, j] <= T_me:
-                            m_slu += mass[i, j]; T_slu_sum += mass[i, j] * T[i, j]
-                        else:
-                            m_liq += mass[i, j]; T_liq_sum += mass[i, j] * T[i, j]
-            
-            cyc_sol_kg[cycle_idx] = m_sol
-            cyc_slu_kg[cycle_idx] = m_slu
-            cyc_liq_kg[cycle_idx] = m_liq
-            cyc_sol_T[cycle_idx] = T_sol_sum / max(1e-6, m_sol)
-            cyc_slu_T[cycle_idx] = T_slu_sum / max(1e-6, m_slu)
-            cyc_liq_T[cycle_idx] = T_liq_sum / max(1e-6, m_liq)
-
-    with objmode():
-        sys.stdout.write("\r  2D Simulating... 100.0%  \n")
-        sys.stdout.flush()
-
-    return (time_log, drain_log, fill_log, drained_mass_cum, filled_mass_cum, idle_time, T, mass, is_heating_log, 
-            T_snapshots, M_snapshots, cycle_extracted, cycle_filled, cycle_idle_hr, cycle_produced, cycle_stranded,
-            cyc_sol_kg, cyc_slu_kg, cyc_liq_kg, cyc_sol_T, cyc_slu_T, cyc_liq_T,
-            first_drain_time, last_drain_time, cycle_start_mass, cycle_remaining_mass,
-            cycle_extracted_temp_sum, status_log)
+    cycle_extracted = drained_mass_cum - drained_mass_cum_in
+    cycle_filled = filled_mass_cum - filled_mass_cum_in
+    cycle_idle_hr = idle_time - idle_time_in
+    stranded_prev = liquid_now
+    avg_T_ext = cycle_extracted_temp_sum / max(1e-6, cycle_extracted)
+    
+    cyc_sol_T = T_sol_sum / max(1e-6, m_sol)
+    cyc_slu_T = T_slu_sum / max(1e-6, m_slu)
+    cyc_liq_T = T_liq_sum / max(1e-6, m_liq)
+    
+    return (mass, enthalpy, T_snapshots, M_snapshots, snapshot_times, snap_count, time_log, drain_log, fill_log, status_log, is_heating_log,
+            drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
+            cycle_start_mass, cycle_remaining_mass, cycle_extracted, cycle_filled, cycle_idle_hr,
+            m_sol, m_slu, m_liq, cyc_sol_T, cyc_slu_T, cyc_liq_T, avg_T_ext)
 
 # ------------------------------------------------------------
 # DRIVER FUNCTION
@@ -540,7 +459,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     for i in range(N_r):
         r_in = i * dr; r_out = (i + 1) * dr
         V_cell = np.pi * (r_out**2 - r_in**2) * dz
-        
         for j in range(N_z):
             if j < j_fill_int:
                 mass[i, j] = V_cell * rho_start
@@ -563,23 +481,18 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         c_r_lo = i * dr; c_r_hi = (i+1) * dr
         ov_r = max(0.0, min(c_r_hi, r_hi) - max(c_r_lo, r_lo))
         if ov_r <= 0: continue
-        
         for j in range(N_z):
             c_z_lo = j * dz; c_z_hi = (j+1) * dz
             ov_z = max(0.0, min(c_z_hi, z_hi) - max(c_z_lo, z_lo))
             if ov_z <= 0: continue
-            
             w = ov_r * ov_z
             coil_w[i, j] = w
             total_w += w
-            
     if total_w > 0.0:
         for i in range(N_r):
             for j in range(N_z):
                 coil_w[i, j] /= total_w
 
-    # --- FILL FOOTPRINT (3D Localized Source) ---
-    # Safely handle missing cfg keys from older main.py versions
     fill_w = np.zeros(N_r)
     fill_theta_frac = np.zeros(N_r)
     fill_flow_m3h = cfg.get("fill_flow_m3h", 0.0)
@@ -612,13 +525,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
             fill_w /= total_fw
 
     drain_r_idx, drain_z_idx = drain_location
-    
-    T_drain_init = np.interp(enthalpy[drain_r_idx, drain_z_idx] / max(1e-6, mass[drain_r_idx, drain_z_idx]), mat["H_grid"], mat["T_grid"]) if mass[drain_r_idx, drain_z_idx] > 0 else cfg["T_amb_mid"]
-    if T_drain_init < cfg["T_ms"]:
-        print(f"  WARNING: Drain cell is SOLID ({T_drain_init:.1f} °C). It will idle until heat reaches it.")
-    elif T_drain_init <= cfg["T_me"]:
-        print(f"  NOTE: Drain cell is in the melt band ({T_drain_init:.1f} °C). Draining may be sluggish initially.")
-    
     drain_area = np.pi * (drain_diameter / 2.0)**2
     A_coil_total = 2.0 * np.pi * R_coil * n_turns * cfg["d_out"]
     
@@ -631,180 +537,131 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     n_cycles = max(1, cfg["N_cycles"])
     n_steps_heat = max(1, int(cfg["t_window_hr"] * 3600.0 / max(1e-6, cfg["dt_sec"])))
     n_steps_cool = max(1, int(cfg["t_cooldown_hr"] * 3600.0 / max(1e-6, cfg["dt_sec"])))
-    total_steps = n_cycles * n_steps_heat + (n_cycles - 1) * n_steps_cool
-    total_hr = total_steps * cfg["dt_sec"] / 3600.0
+    snapshot_interval_steps = max(1, int(3600.0 / cfg["dt_sec"]))
     
     fill_mdot = fill_flow_m3h * float(np.interp(fill_T, mat["T_grid"], mat["rho_grid"])) / 3600.0
 
-    (time_log, drain_log, fill_log, total_drained, total_filled, idle_hr, final_T, final_mass, 
-     is_heating_log, T_snapshots, M_snapshots, cycle_extracted, cycle_filled, cycle_idle, cycle_produced, cycle_stranded,
-     cyc_sol_kg, cyc_slu_kg, cyc_liq_kg, cyc_sol_T, cyc_slu_T, cyc_liq_T,
-     first_drain, last_drain, cycle_start_mass, cycle_remaining_mass,
-     cycle_extracted_temp_sum, status_log) = kernel_2d(
-        mass, enthalpy, N_r, N_z, dr, dz, 
-        coil_w, R_coil, A_coil_total, cfg["d_in"], cfg["d_out"], cfg["R_f_out"], 
-        cfg["flow_m3h"] * float(np.interp(cfg["T_water_in"], cfg["T_water_arr"], cfg["rho_water_arr"])) / 3600.0,
-        drain_r_idx, drain_z_idx, drain_area,
-        fill_w, fill_theta_frac, fill_z_idx, fill_mdot, fill_T, fill_mode,
-        cfg["T_water_in"], cfg["T_ms"], cfg["T_me"], cfg["Hfus"],
-        mat["T_grid"], mat["H_grid"], mat["rho_grid"], mat["cp_sens_grid"], mat["k_grid"], mat["mu_grid"],
-        cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"],
-        cfg["T_tube_arr"], cfg["k_tube_arr"],
-        cfg["dt_sec"], total_steps, n_steps_heat, n_steps_cool, n_cycles, cfg["T_amb_mid"], U_tank_air,
-        cfg["K_settle"],
-        cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"], cfg["beta_liq"], cfg["dT_natural"]
-    )
+    drained_mass_cum = 0.0
+    filled_mass_cum = 0.0
+    idle_time = 0.0
+    first_drain_time = -1.0
+    last_drain_time = -1.0
+    stranded_prev = 0.0
+    for i in range(N_r):
+        for j in range(N_z):
+            if mass[i, j] > 1e-6:
+                T_curr = np.interp(enthalpy[i, j] / mass[i, j], mat["H_grid"], mat["T_grid"])
+                if T_curr > cfg["T_me"]:
+                    stranded_prev += mass[i, j]
 
-    curve_path = os.path.join(outdir, f"b1_flow_curve.png")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(time_log, drain_log, linewidth=2, color="tab:blue", label="Cumulative Extracted")
-    ax.plot(time_log, fill_log, linewidth=2, color="tab:orange", label="Cumulative Filled")
+    results_2d = {
+        "cycle_metrics": [],
+        "dt_sec": cfg["dt_sec"],
+        "total_hr": (n_cycles * n_steps_heat + (n_cycles - 1) * n_steps_cool) * cfg["dt_sec"] / 3600.0
+    }
     
-    for step in range(len(time_log)):
-        if not is_heating_log[step]:
-            ax.axvspan(time_log[step], time_log[step] + cfg["dt_sec"]/3600.0, color='grey', alpha=0.2, lw=0)
-            
-    legend_elements = [
-        plt.Line2D([0], [0], color='tab:blue', lw=2, label='Extracted'),
-        plt.Line2D([0], [0], color='tab:orange', lw=2, label='Filled'),
-        Patch(facecolor='grey', alpha=0.2, label='Cooling Phase')
-    ]
-    ax.legend(handles=legend_elements, loc="upper left")
-    ax.set_xlabel("Time (hours)")
-    ax.set_ylabel("Mass (kg)")
-    ax.set_title(f"Mass Flow Curve ({n_cycles} Cycles)")
-    ax.grid(True, alpha=0.3)
-    fig.savefig(curve_path, dpi=130); plt.close(fig)
+    time_log_all = []
+    drain_log_all = []
+    fill_log_all = []
+    is_heating_log_all = []
+    status_log_all = []
 
-    heatmap_paths = []
-    massmap_paths = []
-    topmass_paths = []
-    toptemp_paths = []
-    phase_bar_paths = []
-    
-    r_edges = np.linspace(0, cfg["r_inner"], N_r + 1)
-    col_vol = np.pi * (r_edges[1:]**2 - r_edges[:-1]**2) * tank_height
-    vmax_density = float(np.max(mat["rho_grid"]))
+    outputs.make_run_dirs(outdir)
 
     for c in range(n_cycles):
+        do_cool = (c < n_cycles - 1)
+        
+        (mass, enthalpy, T_snaps, M_snaps, snap_times, snap_count, t_log, d_log, f_log, s_log, h_log,
+         drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
+         start_m, rem_m, ext_kg, fil_kg, idle_h, m_sol, m_slu, m_liq, T_sol, T_slu, T_liq, avg_T_ext) = cycle_kernel(
+            mass, enthalpy, N_r, N_z, dr, dz, 
+            coil_w, R_coil, A_coil_total, cfg["d_in"], cfg["d_out"], cfg["R_f_out"], 
+            cfg["flow_m3h"] * float(np.interp(cfg["T_water_in"], cfg["T_water_arr"], cfg["rho_water_arr"])) / 3600.0,
+            drain_r_idx, drain_z_idx, drain_area,
+            fill_w, fill_theta_frac, fill_z_idx, fill_mdot, fill_T, fill_mode,
+            cfg["T_water_in"], cfg["T_ms"], cfg["T_me"], cfg["Hfus"],
+            mat["T_grid"], mat["H_grid"], mat["rho_grid"], mat["cp_sens_grid"], mat["k_grid"], mat["mu_grid"],
+            cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"],
+            cfg["T_tube_arr"], cfg["k_tube_arr"],
+            cfg["dt_sec"], n_steps_heat, n_steps_cool, do_cool, n_cycles, cfg["T_amb_mid"], U_tank_air,
+            cfg["K_settle"],
+            cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"], cfg["beta_liq"], cfg["dT_natural"],
+            drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
+            snapshot_interval_steps
+        )
+
+        time_log_all.append(t_log)
+        drain_log_all.append(d_log)
+        fill_log_all.append(f_log)
+        is_heating_log_all.append(h_log)
+        status_log_all.append(s_log)
+
+        eff = (ext_kg / start_m * 100.0) if start_m > 0 else 0.0
+        util = ((cfg["t_window_hr"] - idle_h) / cfg["t_window_hr"] * 100.0) if cfg["t_window_hr"] > 0 else 0.0
+        max_possible_fill = fill_flow_m3h * float(np.interp(fill_T, mat["T_grid"], mat["rho_grid"])) * cfg["t_window_hr"]
+        fill_util = (fil_kg / max_possible_fill * 100.0) if max_possible_fill > 0 else 0.0
+
+        cycle_metric = {
+            "cycle": c + 1, "start_mass": start_m, "remaining_mass": rem_m,
+            "extracted_kg": ext_kg, "filled_kg": fil_kg, "extracted_temp_avg": avg_T_ext,
+            "efficiency_pct": eff, "utilisation_pct": util, "fill_util_pct": fill_util,
+            "heatmaps": [], "massmaps": [], "snapshot_times": snap_times[:snap_count]
+        }
+        results_2d["cycle_metrics"].append(cycle_metric)
+
+        cdir = outputs.make_cycle_dirs(outdir, c + 1)
         r_grid = np.linspace(0, cfg["r_inner"], N_r)
         z_grid = np.linspace(0, tank_height, N_z)
-        
-        r_wall_start = cfg["r_inner"]
-        r_wall_end = cfg["r_inner"] + cfg["t_wall"]
-        r_ins_end = r_wall_end + cfg["t_ins"]
-        
-        h_path = os.path.join(outdir, f"b1_heatmap_cyc{c+1}.png")
-        fig, ax = plt.subplots(figsize=(10, 8))
-        cmap = plt.cm.inferno.copy(); cmap.set_bad('white') 
-        c_mesh = ax.pcolormesh(r_grid, z_grid, T_snapshots[c].T, cmap=cmap, shading='auto')
-        ax.axvspan(r_wall_start, r_wall_end, color='dimgrey', alpha=0.8, lw=0)
-        if cfg["t_ins"] > 0:
-            ax.axvspan(r_wall_end, r_ins_end, color='lightgrey', alpha=0.8, lw=0, hatch='//')
-        fig.colorbar(c_mesh, ax=ax, label='Temperature (°C)')
-        ax.set_title(f"Cycle {c+1} — Lateral Temp"); ax.set_xlim(0, r_ins_end)
-        fig.savefig(h_path, dpi=130); plt.close(fig)
-        heatmap_paths.append(h_path)
 
-        m_path = os.path.join(outdir, f"b1_massmap_cyc{c+1}.png")
-        fig, ax = plt.subplots(figsize=(10, 8))
-        cmap_m = plt.cm.Blues.copy(); cmap_m.set_bad('white')
-        m_mesh = ax.pcolormesh(r_grid, z_grid, M_snapshots[c].T, cmap=cmap_m, shading='auto')
-        ax.axvspan(r_wall_start, r_wall_end, color='dimgrey', alpha=0.8, lw=0)
-        fig.colorbar(m_mesh, ax=ax, label='Mass (kg)')
-        ax.set_title(f"Cycle {c+1} — Lateral Mass"); ax.set_xlim(0, r_ins_end)
-        fig.savefig(m_path, dpi=130); plt.close(fig)
-        massmap_paths.append(m_path)
+        for s in range(snap_count):
+            hr = snap_times[s]
+            h_path = outputs.plot_heat_combined(
+                cdir, T_snaps[s], r_grid, z_grid, N_r, N_z, cfg, tank_height, hr, 
+                cfg.get("drain_r_idx", 0), cfg.get("drain_angle", 0), 
+                cfg.get("fill_r_idx", 0), cfg.get("fill_angle", 0)
+            )
+            m_path = outputs.plot_mass_combined(
+                cdir, M_snaps[s], r_grid, z_grid, N_r, N_z, cfg, tank_height, hr,
+                cfg.get("drain_r_idx", 0), cfg.get("drain_angle", 0), 
+                cfg.get("fill_r_idx", 0), cfg.get("fill_angle", 0)
+            )
+            cycle_metric["heatmaps"].append(f"cycles/cycle_{c+1:02d}/{os.path.basename(h_path)}")
+            cycle_metric["massmaps"].append(f"cycles/cycle_{c+1:02d}/{os.path.basename(m_path)}")
 
-        theta = np.linspace(0, 2*np.pi, 100)
-        R_mesh, Theta_mesh = np.meshgrid(r_grid, theta)
-        
-        col_mass = np.nansum(M_snapshots[c], axis=1)
-        col_density = col_mass / np.maximum(1e-9, col_vol)
-        
-        M_mesh = np.tile(col_density, (len(theta), 1))
-        
-        tm_path = os.path.join(outdir, f"b1_topmass_cyc{c+1}.png")
-        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'})
-        p_mesh = ax.pcolormesh(Theta_mesh, R_mesh, M_mesh, cmap='Blues', shading='auto',
-                               vmin=0.0, vmax=vmax_density)
-        cbar = fig.colorbar(p_mesh, ax=ax, label='Column Density (kg/m³)', pad=0.1)
-        cbar.set_ticks([0.0, vmax_density*0.25, vmax_density*0.5, vmax_density*0.75, vmax_density])
-        cbar.set_ticklabels(['0 (empty)', f'{vmax_density*0.25:.0f}', f'{vmax_density*0.5:.0f}', f'{vmax_density*0.75:.0f}', f'{vmax_density:.0f} (full)'])
-        ax.set_title(f"Cycle {c+1} — Top-Down Density", pad=20)
-        ax.set_yticklabels([])
-        fig.savefig(tm_path, dpi=130, bbox_inches='tight'); plt.close(fig)
-        topmass_paths.append(tm_path)
+        outputs.plot_phase_bar(cdir, m_sol, m_slu, m_liq, T_sol, T_slu, T_liq, c)
+        outputs.write_cycle_summary(cdir, cycle_metric, c)
 
-        top_T = np.full(N_r, np.nan)
-        for i in range(N_r):
-            for j in range(N_z - 1, -1, -1):
-                if M_snapshots[c][i, j] > 1e-6:
-                    top_T[i] = T_snapshots[c][i, j]
-                    break
-        
-        T_mesh = np.tile(top_T, (len(theta), 1))
-        
-        tt_path = os.path.join(outdir, f"b1_toptemp_cyc{c+1}.png")
-        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw={'projection': 'polar'})
-        p_mesh_t = ax.pcolormesh(Theta_mesh, R_mesh, T_mesh, cmap='inferno', shading='auto')
-        fig.colorbar(p_mesh_t, ax=ax, label='Surface Temp (°C)', pad=0.1)
-        ax.set_title(f"Cycle {c+1} — Top-Down Surface Temp", pad=20)
-        ax.set_yticklabels([])
-        fig.savefig(tt_path, dpi=130, bbox_inches='tight'); plt.close(fig)
-        toptemp_paths.append(tt_path)
+        print(f"  Cycle {c+1}/{n_cycles}: Extracted={ext_kg:.1f} kg, Filled={fil_kg:.1f} kg, "
+              f"Eff={eff:.1f}%, DrainUtil={util:.1f}%, FillUtil={fill_util:.1f}%")
 
-        pb_path = os.path.join(outdir, f"b1_phasebar_cyc{c+1}.png")
-        fig, ax = plt.subplots(figsize=(6, 4))
-        phases = ['Solid', 'Slurry', 'Liquid']
-        masses = [cyc_sol_kg[c], cyc_slu_kg[c], cyc_liq_kg[c]]
-        temps = [cyc_sol_T[c], cyc_slu_T[c], cyc_liq_T[c]]
-        colors = ['tab:gray', 'tab:orange', 'tab:blue']
-        bars = ax.bar(phases, masses, color=colors)
-        for idx, bar in enumerate(bars):
-            if masses[idx] > 0:
-                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(masses)*0.02, 
-                        f"{masses[idx]:.0f} kg\n{temps[idx]:.1f} °C", ha='center', fontsize=9)
-        ax.set_ylabel("Mass (kg)"); ax.set_title(f"Cycle {c+1} — Phase Distribution")
-        ax.grid(True, alpha=0.3, axis='y')
-        fig.savefig(pb_path, dpi=130); plt.close(fig)
-        phase_bar_paths.append(pb_path)
+        results_2d["total_extracted_kg"] = drained_mass_cum
+        results_2d["total_filled_kg"] = filled_mass_cum
+        results_2d["final_mass"] = float(np.sum(mass))
+        results_2d["first_drain"] = first_drain_time
+        results_2d["last_drain"] = last_drain_time
+        outputs.write_report_html(outdir, cfg, R_coil, n_turns, results_2d)
 
-    cycle_metrics = []
-    for c in range(n_cycles):
-        eff = (cycle_extracted[c] / cycle_start_mass[c] * 100.0) if cycle_start_mass[c] > 0 else 0.0
-        util = ((cfg["t_window_hr"] - cycle_idle[c]) / cfg["t_window_hr"] * 100.0) if cfg["t_window_hr"] > 0 else 0.0
-        
-        max_possible_fill = fill_flow_m3h * float(np.interp(fill_T, mat["T_grid"], mat["rho_grid"])) * cfg["t_window_hr"]
-        fill_util = (cycle_filled[c] / max_possible_fill * 100.0) if max_possible_fill > 0 else 0.0
+    time_log_all = np.concatenate(time_log_all)
+    drain_log_all = np.concatenate(drain_log_all)
+    fill_log_all = np.concatenate(fill_log_all)
+    is_heating_log_all = np.concatenate(is_heating_log_all)
+    status_log_all = np.concatenate(status_log_all)
 
-        avg_T_ext = cycle_extracted_temp_sum[c] / max(1e-6, cycle_extracted[c])
-        cycle_metrics.append({
-            "cycle": c + 1,
-            "start_mass": cycle_start_mass[c],
-            "remaining_mass": cycle_remaining_mass[c],
-            "extracted_kg": cycle_extracted[c],
-            "filled_kg": cycle_filled[c],
-            "extracted_temp_avg": avg_T_ext,
-            "efficiency_pct": eff,
-            "utilisation_pct": util,
-            "fill_util_pct": fill_util
-        })
+    fdir = os.path.join(outdir, "final")
+    outputs.plot_flow_curve(fdir, time_log_all, drain_log_all, fill_log_all, is_heating_log_all, cfg["dt_sec"], n_cycles)
+    outputs.write_final_summary(fdir, drained_mass_cum, filled_mass_cum, float(np.sum(mass)), first_drain_time, last_drain_time, results_2d["total_hr"])
 
-    return {
-        "curve_path": curve_path,
-        "heatmap_paths": heatmap_paths,
-        "massmap_paths": massmap_paths,
-        "topmass_paths": topmass_paths,
-        "toptemp_paths": toptemp_paths,
-        "phasebar_paths": phase_bar_paths,
-        "total_hr": total_hr,
-        "total_extracted_kg": total_drained,
-        "total_filled_kg": total_filled,
-        "final_mass": float(np.sum(final_mass)),
-        "first_drain": float(first_drain),
-        "last_drain": float(last_drain),
-        "cycle_metrics": cycle_metrics,
-        "status_log": status_log,
-        "dt_sec": float(cfg["dt_sec"]),
-    }
+    results_2d["status_log"] = status_log_all
+    results_2d["total_extracted_kg"] = drained_mass_cum
+    results_2d["total_filled_kg"] = filled_mass_cum
+    results_2d["final_mass"] = float(np.sum(mass))
+    results_2d["first_drain"] = first_drain_time
+    results_2d["last_drain"] = last_drain_time
+
+    outputs.write_report_html(outdir, cfg, R_coil, n_turns, results_2d)
+
+    with objmode():
+        sys.stdout.write("\r  2D Simulation complete. Report generated.\n")
+        sys.stdout.flush()
+
+    return results_2d
