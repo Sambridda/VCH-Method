@@ -1,9 +1,9 @@
 """Inputs: Simplified UI. Removes editable tables; relies on PCHIP cached data."""
 import json
 import numpy as np
+import traceback
 from .geometry import max_turns
 from . import materials
-import traceback
 
 ENV_PRESETS = [("Indoor  (h_air = 5 W/m2K)", 5.0),
                ("Outdoor  (h_air = 10 W/m2K)", 10.0),
@@ -24,6 +24,12 @@ SCALAR_DEFAULTS = dict(
     env_index=0, t_ins=0.0, k_ins=0.038,
     r_inner=1.22, L_avail=2.3, fill_from_geometry=True, M_fluid=0.0,
     t_window_hr=12.0, t_cooldown_hr=12.0, N=100, dt_sec=1.0, n_samples=10,
+    
+    # --- NEW 2D DRAINING PARAMETERS ---
+    tank_height=2.8, coil_clearance_bottom=0.2,
+    has_makeup=False, makeup_T=20.0,
+    N_cycles=1, K_settle=1.0, T_start=20.0,
+    simulate_drain=True, drain_diameter=0.05, drain_r_idx=0, drain_z_idx=0,
 )
 
 def build_cfg(inp):
@@ -36,14 +42,12 @@ def build_cfg(inp):
     if g["T_water_in"] <= g["T_amb_low"]: errors.append("Coil inlet temperature must be above low ambient.")
     if not (20 <= g["N"] <= 500): errors.append("Radial nodes N must be between 20 and 500.")
     
-    # --- Pull the auto-calculated values from materials.py ---
     if g["tank_name"] not in materials.MELT_PROPS:
         return None, [f"Could not find melting data for '{g['tank_name']}'.\n\nYou MUST select a material that has a melting point (like RBD Palm Oil), not Water."], []
     
     T_ms_calc, T_me_calc, Hfus_calc = materials.MELT_PROPS[g["tank_name"]]
 
     if T_ms_calc >= T_me_calc: errors.append("Melt-start must be below melt-end.")
-    # REMOVED: Low ambient restriction is gone
     if T_me_calc >= g["T_water_in"]: errors.append("Melt-end must be below coil inlet.")
 
     if errors: return None, errors, warnings
@@ -53,7 +57,6 @@ def build_cfg(inp):
     ag_C, ag_a = (materials.IMPELLERS[ag_idx]["C"], materials.IMPELLERS[ag_idx]["a"]) if 0 <= ag_idx < len(materials.IMPELLERS) else (0.54, 0.67)
     h_air = ENV_PRESETS[int(g["env_index"])][1]
 
-    # --- CRITICAL FIX: Convert lists to numpy arrays so [:, 0] slicing works ---
     fluid_data = np.array(materials.FLUIDS.get(g["fluid_name"]))
     tank_data = np.array(materials.FLUIDS.get(g["tank_name"]))
     wall_data = np.array(materials.METALS.get(g["wall_name"]))
@@ -101,6 +104,13 @@ def build_cfg(inp):
         D_imp=float(D_imp) if g["has_agitator"] else 0.0,
         visc_corr=float(g["visc_corr"]) if g["has_agitator"] else 1.0,
         beta_liq=g["beta_liq"], dT_natural=g["dT_natural"],
+        
+        # --- NEW 2D DRAINING CONFIGURATION ---
+        tank_height=g["tank_height"], coil_clearance_bottom=g["coil_clearance_bottom"],
+        has_makeup=1 if g["has_makeup"] else 0, makeup_T=g["makeup_T"],
+        simulate_drain=g["simulate_drain"], drain_diameter=g["drain_diameter"], 
+        drain_r_idx=int(g["drain_r_idx"]), drain_z_idx=int(g["drain_z_idx"]),
+        N_cycles=int(g["N_cycles"]), K_settle=float(g["K_settle"]), T_start=float(g["T_start"]),
     )
 
     V_tank = np.pi * cfg["r_inner"] ** 2 * cfg["L_avail"]
@@ -198,7 +208,6 @@ class InputsForm(QtWidgets.QWidget):
         f = QtWidgets.QFormLayout()
         self._num(f, "T_water_in", "Coil inlet temperature", d["T_water_in"], "degC")
         self._num(f, "flow_m3h", "Coil volumetric flow", d["flow_m3h"], "m3/h")
-        # ADDED BACK: These are required for the natural convection physics equations
         self._num(f, "beta_liq", "Thermal expansion coeff (beta)", d["beta_liq"], "1/K")
         self._num(f, "dT_natural", "Driving delta-T", d["dT_natural"], "K")
         lay.addWidget(self._group("Operating Conditions", f))
@@ -271,20 +280,44 @@ class InputsForm(QtWidgets.QWidget):
         f = QtWidgets.QFormLayout()
         self._num(f, "r_inner", "Tank inner radius", d["r_inner"], "m")
         self._num(f, "L_avail", "Coil axial length", d["L_avail"], "m")
+        self._num(f, "tank_height", "Total tank height", d["tank_height"], "m")
+        self._num(f, "coil_clearance_bottom", "Bottom clearance", d["coil_clearance_bottom"], "m")
         lay.addWidget(self._group("Tank Geometry", f))
+        
         f = QtWidgets.QFormLayout()
         self.cb_fill = QtWidgets.QCheckBox("Fill mass from geometry")
         self.cb_fill.setChecked(d["fill_from_geometry"]); self.fields["fill_from_geometry"] = self.cb_fill
         f.addRow(self.cb_fill)
         self._num(f, "M_fluid", "Fluid mass", 9000.0, "kg")
         lay.addWidget(self._group("Tank Fluid Mass", f))
+        
         f = QtWidgets.QFormLayout()
+        self._num(f, "N_cycles", "Number of Cycles", d["N_cycles"], "int", True)
         self._num(f, "t_window_hr", "Heating window", d["t_window_hr"], "h")
         self._num(f, "t_cooldown_hr", "Cooldown window", d["t_cooldown_hr"], "h")
-        self._num(f, "N", "Radial nodes N", d["N"], "int", True)
+        self._num(f, "T_start", "Initial Tank Temp", d["T_start"], "degC")
+        self._num(f, "K_settle", "Settling Coefficient", d["K_settle"], "float")
         self._num(f, "dt_sec", "Timestep dt", d["dt_sec"], "s")
-        self._num(f, "n_samples", "Turn samples", d["n_samples"], "int", True)
-        lay.addWidget(self._group("Simulation", f))
+        self._num(f, "N", "Radial nodes N (1D Sweep)", d["N"], "int", True)
+        self._num(f, "n_samples", "Turn samples (1D Sweep)", d["n_samples"], "int", True)
+        lay.addWidget(self._group("Simulation Settings", f))
+
+        f = QtWidgets.QFormLayout()
+        self.cb_makeup = QtWidgets.QCheckBox("Refill tank while draining")
+        self.cb_makeup.setChecked(d["has_makeup"]); self.fields["has_makeup"] = self.cb_makeup
+        f.addRow(self.cb_makeup)
+        self._num(f, "makeup_T", "Make-up fluid temp", d["makeup_T"], "degC")
+        lay.addWidget(self._group("Draining Setup", f))
+
+        f = QtWidgets.QFormLayout()
+        self.cb_drain = QtWidgets.QCheckBox("Simulate continuous draining")
+        self.cb_drain.setChecked(d["simulate_drain"]); self.fields["simulate_drain"] = self.cb_drain
+        f.addRow(self.cb_drain)
+        self._num(f, "drain_diameter", "Drain valve diameter", d["drain_diameter"], "m")
+        self._num(f, "drain_r_idx", "Drain radial index (0-49)", d["drain_r_idx"], "int", True)
+        self._num(f, "drain_z_idx", "Drain axial index (0-49)", d["drain_z_idx"], "int", True)
+        lay.addWidget(self._group("Drain Valve", f))
+        
         lay.addStretch(); return w
 
     def _agitator_toggled(self, on):

@@ -1,13 +1,12 @@
-"""Parses VCH Framework.xlsx into high-resolution smooth curves using PCHIP.
-Generates graphs, caches the data for the engine, and checks for updates."""
+"""Parses VCH Framework.xlsx into high-resolution smooth curves using PCHIP."""
 import os
 import json
+import shutil
 import numpy as np
 import openpyxl
 from scipy.interpolate import PchipInterpolator
-
 import matplotlib
-matplotlib.use('Agg')  # MUST BE BEFORE PYPLOT IMPORT (Thread safety)
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 
@@ -21,7 +20,7 @@ FLUIDS = {}
 METALS = {}
 INSULATION = {}
 IMPELLERS = []
-MELT_PROPS = {}  
+MELT_PROPS = {}
 
 def _densify(x, y, num_points=1000):
     if len(x) < 3: return x, y
@@ -30,22 +29,18 @@ def _densify(x, y, num_points=1000):
     return x_dense, spline(x_dense)
 
 def _plot_and_save(name, t, data_cols, labels, ylabel, color, is_fluid=True):
-    os.makedirs(MAT_DIR, exist_ok=True)
     fig = Figure(figsize=(8, 5))
     ax1 = fig.add_subplot(111)
-    
     ax1.plot(t, data_cols[0], color=color, label=labels[0], linewidth=2)
     ax1.set_xlabel("Temperature (°C)")
     ax1.set_ylabel(f"{labels[0]} ({'kg/m³' if is_fluid else 'J/(kg·K)'})", color=color)
     ax1.tick_params(axis='y', labelcolor=color)
     ax1.grid(True, alpha=0.3)
-    
     if len(data_cols) > 1:
         ax2 = ax1.twinx()
         ax2.plot(t, data_cols[1], color='tab:red', label=labels[1], linewidth=2, linestyle='--')
         ax2.set_ylabel(f"{labels[1]}", color='tab:red')
         ax2.tick_params(axis='y', labelcolor='tab:red')
-        
     ax1.set_title(f"{name} Properties (PCHIP Interpolated)")
     fig.tight_layout()
     safe_name = name.replace(' ', '_').replace('/', '_').lower()
@@ -53,24 +48,20 @@ def _plot_and_save(name, t, data_cols, labels, ylabel, color, is_fluid=True):
     plt.close(fig)
 
 def process_materials(force=False):
-    # CRITICAL FIX: Added MELT_PROPS to the global statement
     global FLUIDS, METALS, INSULATION, IMPELLERS, MELT_PROPS
-    
-    if not os.path.exists(EXCEL_PATH):
-        raise FileNotFoundError(f"Excel file not found at {EXCEL_PATH}")
+    if not os.path.exists(EXCEL_PATH): raise FileNotFoundError(f"Excel file not found at {EXCEL_PATH}")
 
     if not force and os.path.exists(CACHE_FILE):
-        excel_mtime = os.path.getmtime(EXCEL_PATH)
-        cache_mtime = os.path.getmtime(CACHE_FILE)
-        if cache_mtime > excel_mtime:
-            _load_from_cache()
-            return True
+        if os.path.getmtime(CACHE_FILE) > os.path.getmtime(EXCEL_PATH):
+            _load_from_cache(); return True
 
     FLUIDS, METALS, INSULATION, IMPELLERS, MELT_PROPS = {}, {}, {}, [], {}
 
+    if os.path.exists(MAT_DIR): shutil.rmtree(MAT_DIR)
+    os.makedirs(MAT_DIR, exist_ok=True)
+
     wb = openpyxl.load_workbook(EXCEL_PATH, data_only=True)
     
-    # --- 1. FLUIDS ---
     if "Fluids" in wb.sheetnames:
         ws = wb["Fluids"]
         current_name = None
@@ -87,10 +78,14 @@ def process_materials(force=False):
                 mu = float(row[5]) if isinstance(row[5], (int, float)) else 1.0
                 k = float(row[6]) if isinstance(row[6], (int, float)) else 0.5
                 
-                latent = float(row[7]) if len(row) > 7 and isinstance(row[7], (int, float)) else 0.0
+                dH = 0.0
+                if row[7] and isinstance(row[7], (int, float)): dH = float(row[7])
+                elif row[7] and isinstance(row[7], str):
+                    try: dH = float(row[7].split("(")[0].strip())
+                    except: pass
                 
                 if current_name not in raw_data: raw_data[current_name] = []
-                raw_data[current_name].append((t, rho, cp, mu, k, latent))
+                raw_data[current_name].append((t, rho, cp, mu, k, dH))
         
         for name, data in raw_data.items():
             arr = np.array(sorted(data, key=lambda x: x[0]))
@@ -98,22 +93,15 @@ def process_materials(force=False):
             arr = arr[idx]
             t_raw = arr[:, 0]
             
-            if len(t_raw) < 3: continue
+            dH_vals = arr[:, 5]
+            max_dH = np.max(dH_vals)
+            if max_dH > 0:
+                melt_idx = np.argmax(dH_vals)
+                T_ms = t_raw[max(0, melt_idx - 1)]
+                T_me = t_raw[min(len(t_raw)-1, melt_idx + 1)]
+                MELT_PROPS[name] = (T_ms, T_me, max_dH * 1000.0) 
             
-            latent_arr = arr[:, 5]
-            if np.any(latent_arr > 0):
-                # NEW LOGIC: Find the peak latent heat to identify the bulk melting region
-                peak_latent = np.max(latent_arr)
-                
-                # Define Melt-Start as the temperature where latent heat reaches 50% of the peak
-                melt_mask = latent_arr >= (0.5 * peak_latent)
-                
-                T_ms_calc = float(arr[melt_mask, 0].min()) 
-                T_me_calc = float(arr[melt_mask, 0].max()) 
-                
-                # Total latent heat is still the sum of all non-zero values
-                Hfus_calc = float(latent_arr[latent_arr > 0].sum() * 1000.0)
-                MELT_PROPS[name] = (T_ms_calc, T_me_calc, Hfus_calc)
+            if len(t_raw) < 3: continue
                 
             t_dense, rho_d = _densify(t_raw, arr[:, 1])
             _, cp_d = _densify(t_raw, arr[:, 2])
@@ -123,7 +111,6 @@ def process_materials(force=False):
             FLUIDS[name] = np.column_stack((t_dense, rho_d, cp_d, mu_d, k_d)).tolist()
             _plot_and_save(name, t_dense, [rho_d, cp_d], ["Density", "Specific Heat"], "Property", "tab:blue", True)
 
-    # --- 2. METALS ---
     if "Metals" in wb.sheetnames:
         ws = wb["Metals"]
         current_name = None
@@ -133,7 +120,6 @@ def process_materials(force=False):
             if row[2] is not None and current_name:
                 try: t = float(row[2])
                 except (ValueError, TypeError): continue
-                if np.isnan(t): continue
                 
                 rho = float(row[3]) if isinstance(row[3], (int, float)) else 7800.0
                 cp = float(row[4]) if isinstance(row[4], (int, float)) else 500.0
@@ -147,7 +133,6 @@ def process_materials(force=False):
             _, idx = np.unique(arr[:, 0], return_index=True)
             arr = arr[idx]
             t_raw = arr[:, 0]
-            
             if len(t_raw) < 3: continue
                 
             t_dense, rho_d = _densify(t_raw, arr[:, 1])
@@ -157,7 +142,6 @@ def process_materials(force=False):
             METALS[name] = np.column_stack((t_dense, rho_d, cp_d, k_d)).tolist()
             _plot_and_save(name, t_dense, [cp_d, k_d], ["Specific Heat", "Thermal Cond."], "Property", "tab:green", False)
 
-    # --- 3. INSULATION & IMPELLERS ---
     if "Insulation" in wb.sheetnames:
         ws = wb["Insulation"]
         for row in ws.iter_rows(min_row=2, values_only=True):
@@ -169,24 +153,17 @@ def process_materials(force=False):
         ws = wb["Impellers"]
         for row in ws.iter_rows(min_row=2, values_only=True):
             if row[0] and row[2] and row[3]:
-                try:
-                    IMPELLERS.append(dict(name=str(row[0]).strip(), pattern=str(row[1]).strip() if row[1] else "",
-                                          C=float(row[2]), a=float(row[3])))
+                try: IMPELLERS.append(dict(name=str(row[0]).strip(), pattern=str(row[1]).strip() if row[1] else "", C=float(row[2]), a=float(row[3])))
                 except (ValueError, TypeError): pass
 
-    # --- SAVE CACHE ---
-    os.makedirs(OUT_DIR, exist_ok=True)
-    cache_data = dict(FLUIDS=FLUIDS, METALS=METALS, INSULATION=INSULATION, IMPELLERS=IMPELLERS, MELT_PROPS=MELT_PROPS)    
-    with open(CACHE_FILE, "w") as f:
-        json.dump(cache_data, f)
-        
+    cache_data = dict(FLUIDS=FLUIDS, METALS=METALS, INSULATION=INSULATION, IMPELLERS=IMPELLERS, MELT_PROPS=MELT_PROPS)
+    with open(CACHE_FILE, "w") as f: json.dump(cache_data, f)
     return True
 
 def _load_from_cache():
     global FLUIDS, METALS, INSULATION, IMPELLERS, MELT_PROPS
     if not os.path.exists(CACHE_FILE): return
-    with open(CACHE_FILE, "r") as f:
-        data = json.load(f)
+    with open(CACHE_FILE, "r") as f: data = json.load(f)
     
     FLUIDS = {k: np.array(v) for k, v in data.get("FLUIDS", {}).items()}
     METALS = {k: np.array(v) for k, v in data.get("METALS", {}).items()}
@@ -194,5 +171,4 @@ def _load_from_cache():
     IMPELLERS = data.get("IMPELLERS", [])
     MELT_PROPS = data.get("MELT_PROPS", {})
 
-if os.path.exists(CACHE_FILE):
-    _load_from_cache()
+if os.path.exists(CACHE_FILE): _load_from_cache()
