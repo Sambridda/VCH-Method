@@ -1,80 +1,10 @@
-# ============================================================
-# engine_2d.py — 2D Draining Physics Engine (UI Data Provider)
-# ============================================================
+# physics/engine_2d.py
 import numpy as np
 from numba import njit, objmode
 import os
 import sys
 import outputs
-
-# ------------------------------------------------------------
-# 1D NTU HEAT TRANSFER FUNCTIONS
-# ------------------------------------------------------------
-@njit(cache=True)
-def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
-    A = np.pi * (d_in/2.0)**2
-    v = m_dot / (max(1e-6, rho) * A)
-    Re = rho * v * d_in / max(1e-6, mu)
-    Pr = mu * cp / max(1e-6, k)
-    if Re > 10000.0:
-        f = (0.79*np.log(Re) - 1.64)**-2
-        Nu = (f/8.0)*(Re - 1000.0)*Pr/(1.0 + 2.17*np.sqrt(f/8.0)*(Pr**(2.0/3.0) - 1.0))
-        Nu *= (1.0 + (d_in / d_coil_actual)**0.9)
-    else:
-        Nu = 4.36
-    return Nu * k / d_in
-
-@njit(cache=True)
-def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
-               has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out):
-    if T_oil < T_ms and has_agitator == 0:
-        return 5.0
-    rho = np.interp(T_oil, T_grid, rho_grid)
-    cp  = np.interp(T_oil, T_grid, cp_grid)
-    k   = np.interp(T_oil, T_grid, k_grid)
-    mu  = np.interp(T_oil, T_grid, mu_grid)
-    
-    if has_agitator == 1:
-        N_rps = N_rpm / 60.0
-        Re_ia = rho * N_rps * (D_imp**2) / max(1e-6, mu)
-        Pr = mu * cp / max(1e-6, k)
-        if ag_type == 1: C, a = 0.60, 0.67
-        elif ag_type == 2: C, a = 0.54, 0.67
-        elif ag_type == 3: C, a = 0.40, 0.50
-        else: C, a = 0.35, 0.50
-        Nu = C * (Re_ia ** a) * (Pr ** (1.0/3.0)) * visc_corr
-        return Nu * k / d_out
-    else:
-        nu = mu / max(1e-6, rho); alpha = k / max(1e-6, rho * cp); Pr = nu / max(1e-6, alpha)
-        d_char = d_out
-        Ra = 9.81 * beta * dT_natural * (d_char**3) / max(1e-6, nu * alpha)
-        Nu = (0.60 + (0.387 * Ra**(1.0/6.0)) / (1.0 + (0.559/max(1e-6, Pr))**(9.0/16.0))**(8.0/27.0))**2
-        return Nu * k / d_char
-
-@njit(cache=True)
-def calc_Q(m_dot, T_band, T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actual,
-           T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
-           T_tube_arr, k_tube_arr,
-           T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-           has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
-    if T_band >= T_water_in: return 0.0
-    T_eff = 0.5*(T_water_in + T_band)
-    rho_c = np.interp(T_eff, T_water_arr, rho_water_arr)
-    cp_c  = np.interp(T_eff, T_water_arr, cp_water_arr)
-    mu_c  = np.interp(T_eff, T_water_arr, mu_water_arr)
-    k_c   = np.interp(T_eff, T_water_arr, k_water_arr)
-    k_tube = np.interp(T_eff, T_tube_arr, k_tube_arr)
-
-    h_in  = h_internal(m_dot, d_in, d_coil_actual, rho_c, cp_c, mu_c, k_c)
-    h_out = h_external(T_band, T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-                       has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out)
-                       
-    R_in = 1.0/h_in
-    R_wall = (d_out*np.log(d_out/d_in))/(2.0*k_tube)
-    U = 1.0/(R_in + R_wall + R_f_out + 1.0/h_out)
-    NTU = U*A_coil/(m_dot*cp_c)
-    eps = 1.0 - np.exp(-NTU)
-    return eps * m_dot * cp_c * (T_water_in - T_band)
+from .heat_transfer import is_flowable, h_internal, h_external, calc_Q
 
 # ------------------------------------------------------------
 # CYCLE KERNEL (Physics for ONE cycle)
@@ -85,12 +15,12 @@ def cycle_kernel(
         coil_w, R_coil, A_coil_total, d_in, d_out, R_f_out, m_dot_coil,
         drain_r, drain_z, drain_area,
         fill_w, fill_theta_frac, fill_z, fill_mdot, fill_T, fill_mode,
-        T_water_in, T_ms, T_me, Hfus,
+        T_water_in, T_ms, T_me, thresh_liq, thresh_visc, # <-- Removed Hfus here
         T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid,
         T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
         T_tube_arr, k_tube_arr, 
         dt, n_steps_heat, n_steps_cool, do_cool, n_cycles, T_amb, U_tank_air,
-        K_settle, has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural,
+        K_settle, beta, dT_natural,
         drained_mass_cum_in, filled_mass_cum_in, idle_time_in,
         first_drain_time_in, last_drain_time_in, stranded_prev_in,
         snapshot_interval_steps):
@@ -167,10 +97,13 @@ def cycle_kernel(
             if weight_sum > 0.0:
                 T_coil_avg /= weight_sum
                 d_coil_actual = 2.0 * R_coil
-                q_total = calc_Q(m_dot_coil, T_coil_avg, T_water_in, d_in, d_out, R_f_out, A_coil_total, d_coil_actual,
+                
+                H_coil_avg = np.interp(T_coil_avg, T_grid, H_grid)
+                
+                q_total = calc_Q(m_dot_coil, T_coil_avg, H_coil_avg, T_water_in, d_in, d_out, R_f_out, A_coil_total, d_coil_actual,
                                  T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
-                                 T_tube_arr, k_tube_arr, T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-                                 has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural)
+                                 T_tube_arr, k_tube_arr, T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc,
+                                 beta, dT_natural)
                 for i in range(N_r):
                     for j in range(N_z):
                         if coil_w[i, j] > 1e-6 and mass[i, j] > 1e-6:
@@ -207,27 +140,33 @@ def cycle_kernel(
         # 4. Draining
         drained_this_step = 0.0
         if is_heating and drain_area > 0.0:
-            if mass[drain_r, drain_z] > 1e-6 and T[drain_r, drain_z] > T_ms:
-                surf_drain = drain_z
-                for j in range(N_z - 1, drain_z - 1, -1):
-                    if mass[drain_r, j] > 1e-6 and T[drain_r, j] > T_ms:
-                        surf_drain = j
-                        break
-                h_head = max((surf_drain - drain_z) * dz, 0.01)
-                rho_liq = np.interp(T[drain_r, drain_z], T_grid, rho_grid)
-                v_flow = 0.6 * np.sqrt(2.0 * 9.81 * h_head)
-                target_mass = rho_liq * v_flow * drain_area * dt
-                actual_dm = min(target_mass, mass[drain_r, drain_z])
-                if actual_dm > 0.0:
-                    h_spec = enthalpy[drain_r, drain_z] / max(1e-6, mass[drain_r, drain_z])
-                    T_ext = T[drain_r, drain_z]
-                    mass[drain_r, drain_z] -= actual_dm
-                    enthalpy[drain_r, drain_z] -= actual_dm * h_spec
-                    drained_mass_cum += actual_dm
-                    drained_this_step += actual_dm
-                    cycle_extracted_temp_sum += actual_dm * T_ext
-                    if first_drain_time < 0: first_drain_time = time_log[step]
-                    last_drain_time = time_log[step]
+            if mass[drain_r, drain_z] > 1e-6:
+                H_spec = enthalpy[drain_r, drain_z] / max(1e-6, mass[drain_r, drain_z])
+                flowable = is_flowable(T[drain_r, drain_z], H_spec, T_grid, H_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc)
+                if flowable:
+                    surf_drain = drain_z
+                    for j in range(N_z - 1, drain_z - 1, -1):
+                        if mass[drain_r, j] > 1e-6:
+                            H_top = enthalpy[drain_r, j] / max(1e-6, mass[drain_r, j])
+                            if is_flowable(T[drain_r, j], H_top, T_grid, H_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc):
+                                surf_drain = j
+                                break
+                    
+                    h_head = max((surf_drain - drain_z) * dz, 0.01)
+                    rho_liq = np.interp(T[drain_r, drain_z], T_grid, rho_grid)
+                    v_flow = 0.6 * np.sqrt(2.0 * 9.81 * h_head)
+                    target_mass = rho_liq * v_flow * drain_area * dt
+                    actual_dm = min(target_mass, mass[drain_r, drain_z])
+                    if actual_dm > 0.0:
+                        h_spec = enthalpy[drain_r, drain_z] / max(1e-6, mass[drain_r, drain_z])
+                        T_ext = T[drain_r, drain_z]
+                        mass[drain_r, drain_z] -= actual_dm
+                        enthalpy[drain_r, drain_z] -= actual_dm * h_spec
+                        drained_mass_cum += actual_dm
+                        drained_this_step += actual_dm
+                        cycle_extracted_temp_sum += actual_dm * T_ext
+                        if first_drain_time < 0: first_drain_time = time_log[step]
+                        last_drain_time = time_log[step]
 
         did_drain = drained_this_step > 0.0
 
@@ -428,7 +367,7 @@ def cycle_kernel(
 # ------------------------------------------------------------
 # DRIVER FUNCTION
 # ------------------------------------------------------------
-def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diameter, drain_location, outdir):
+def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diameter, drain_location, outdir, on_cycle=None):
     print(f"\n[Engine 2D] Initializing 2D Grid for Draining Simulation...")
     
     res = 5 
@@ -579,13 +518,12 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
             cfg["flow_m3h"] * float(np.interp(cfg["T_water_in"], cfg["T_water_arr"], cfg["rho_water_arr"])) / 3600.0,
             drain_r_idx, drain_z_idx, drain_area,
             fill_w, fill_theta_frac, fill_z_idx, fill_mdot, fill_T, fill_mode,
-            cfg["T_water_in"], cfg["T_ms"], cfg["T_me"], cfg["Hfus"],
+            cfg["T_water_in"], cfg["T_ms"], cfg["T_me"], cfg["thresh_liq"], cfg["thresh_visc"], # <-- Removed cfg["Hfus"]
             mat["T_grid"], mat["H_grid"], mat["rho_grid"], mat["cp_sens_grid"], mat["k_grid"], mat["mu_grid"],
             cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"],
             cfg["T_tube_arr"], cfg["k_tube_arr"],
             cfg["dt_sec"], n_steps_heat, n_steps_cool, do_cool, n_cycles, cfg["T_amb_mid"], U_tank_air,
-            cfg["K_settle"],
-            cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"], cfg["beta_liq"], cfg["dT_natural"],
+            cfg["K_settle"], cfg["beta_liq"], cfg["dT_natural"],
             drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
             snapshot_interval_steps
         )
@@ -631,8 +569,10 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         outputs.plot_phase_bar(cdir, m_sol, m_slu, m_liq, T_sol, T_slu, T_liq, c)
         outputs.write_cycle_summary(cdir, cycle_metric, c)
 
-        print(f"  Cycle {c+1}/{n_cycles}: Extracted={ext_kg:.1f} kg, Filled={fil_kg:.1f} kg, "
-              f"Eff={eff:.1f}%, DrainUtil={util:.1f}%, FillUtil={fill_util:.1f}%")
+        if on_cycle is not None:
+            c_data = dict(cycle_metric)
+            c_data["total_cycles"] = n_cycles
+            on_cycle(c_data)
 
         results_2d["total_extracted_kg"] = drained_mass_cum
         results_2d["total_filled_kg"] = filled_mass_cum

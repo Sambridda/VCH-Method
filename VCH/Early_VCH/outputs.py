@@ -1,6 +1,4 @@
-# ============================================================
-# outputs.py — Plotting, Summaries, and HTML Report
-# ============================================================
+# outputs.py
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -21,6 +19,22 @@ def make_cycle_dirs(outdir, cycle_idx):
     cdir = os.path.join(outdir, "cycles", f"cycle_{cycle_idx:02d}")
     os.makedirs(cdir, exist_ok=True)
     return cdir
+
+def plot_cold(rows, T_amb, out_path, t_window_hr, preset_label):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 9))
+    radii = sorted(set(r["R"] for r in rows)); colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(radii)))
+    for j, R in enumerate(radii):
+        sub = sorted([r for r in rows if r["R"] == R], key=lambda x: x["n"]); L = [r["L_coil"] for r in sub]; lbl = f"R={R:.2f}"
+        ax1.plot(L, [r["liquid"] for r in sub], "-",  color=colors[j], label=f"{lbl} L",   linewidth=1.6)
+        ax1.plot(L, [r["slurry"] for r in sub], "--", color=colors[j], label=f"{lbl} S",   linewidth=1.2)
+        ax1.plot(L, [r["solid"]  for r in sub], ":",  color=colors[j], label=f"{lbl} Sol", linewidth=1.2)
+        ax2.plot(L, [r["liquid_T"] for r in sub], "-",  color=colors[j], label=f"{lbl} liq T")
+        ax2.plot(L, [r["slurry_T"] for r in sub], "--", color=colors[j], label=f"{lbl} slu T")
+        ax2.plot(L, [r["solid_T"]  for r in sub], ":",  color=colors[j], label=f"{lbl} sol T")
+    ax1.set_ylabel("Mass (kg)"); ax1.set_title(f"Cold start — {preset_label} ({T_amb} degC), {t_window_hr:.1f} h heating — L=liquid, S=slurry, Sol=solid")
+    ax1.legend(fontsize=7, ncol=3, loc="upper left"); ax1.grid(True, alpha=0.3)
+    ax2.set_xlabel("Coil length (m)"); ax2.set_ylabel("Avg T (degC)"); ax2.legend(fontsize=6, ncol=3, loc="best"); ax2.grid(True, alpha=0.3)
+    fig.tight_layout(); fig.savefig(out_path, dpi=130); plt.close(fig)
 
 def plot_heat_combined(cdir, T_snap, r_grid, z_grid, N_r, N_z, cfg, tank_height, time_hr,
                        drain_r_idx, drain_angle, fill_r_idx, fill_angle):
@@ -56,7 +70,6 @@ def plot_heat_combined(cdir, T_snap, r_grid, z_grid, N_r, N_z, cfg, tank_height,
     c2 = ax2.pcolormesh(Theta_mesh, R_mesh, T_mesh, cmap=cmap, shading='auto', vmin=vmin, vmax=vmax)
     ax2.set_title("Top-Down Surface Temp"); ax2.set_yticklabels([])
 
-    # Add markers
     if drain_r_idx > 0 or drain_angle > 0:
         d_theta = np.deg2rad(drain_angle)
         d_r = (drain_r_idx + 0.5) * (cfg["r_inner"] / N_r)
@@ -103,7 +116,6 @@ def plot_mass_combined(cdir, M_snap, r_grid, z_grid, N_r, N_z, cfg, tank_height,
     c2 = ax2.pcolormesh(Theta_mesh, R_mesh, D_mesh, cmap='Blues', shading='auto', vmin=0.0, vmax=vmax_density)
     ax2.set_title("Top-Down Column Density"); ax2.set_yticklabels([])
 
-    # Add markers
     if drain_r_idx > 0 or drain_angle > 0:
         d_theta = np.deg2rad(drain_angle)
         d_r = (drain_r_idx + 0.5) * (cfg["r_inner"] / N_r)
@@ -189,6 +201,13 @@ def _html_prop_arrays(name, T_arr, props):
         h.append(f"<tr><td>{label}</td>" + "".join(f"<td>{v:g} {unit}</td>" for v in vals) + "</tr>")
     return "\n".join(h) + "\n</table>"
 
+def _sample_arrays(T, rho, cp, mu, k, n=6):
+    if len(T) <= n:
+        idx = np.arange(len(T))
+    else:
+        idx = np.linspace(0, len(T)-1, n).astype(int)
+    return T[idx], rho[idx], cp[idx], mu[idx], k[idx]
+
 def _render_timeline(status_log, dt_sec, max_bins=400):
     if status_log is None: return "<p style='color:#888;'>Timeline not available.</p>"
     n = len(status_log)
@@ -233,6 +252,7 @@ def _render_timeline(status_log, dt_sec, max_bins=400):
             + f'<div style="font-size:12px; color:#555; margin-bottom:16px;">' + legend + f' &nbsp; (total {total_dur:.2f} h)</div>')
 
 def write_report_html(outdir, cfg, R_ag, n_ag, results_2d=None):
+    mat = cfg["_mat"]
     L_coil = 2.0*np.pi*R_ag*n_ag; A_coil = np.pi*cfg["d_out"]*L_coil
     rho_tube_ref = float(np.interp(cfg["T_water_in"], cfg["T_tube_arr"], cfg["rho_tube_arr"]))
     M_metal = rho_tube_ref * np.pi*0.25*(cfg["d_out"]**2 - cfg["d_in"]**2)*L_coil
@@ -258,9 +278,17 @@ def write_report_html(outdir, cfg, R_ag, n_ag, results_2d=None):
          f"<p><em>Run: {os.path.basename(outdir)}</em></p>"]
 
     h.append("<h2>1. Input Parameters</h2>")
-    h.append(f"<h3>Coil Fluid: {cfg['fluid_name']}</h3>" + _html_prop_arrays("Coil", cfg["T_water_arr"], [("Density", cfg["rho_water_arr"], "kg/m³"), ("Cp", cfg["cp_water_arr"], "J/kgK"), ("Mu", cfg["mu_water_arr"], "Pa·s"), ("k", cfg["k_water_arr"], "W/mK")]))
-    h.append(f"<h3>Tank Fluid: {cfg['tank_name']}</h3>" + _html_prop_arrays("Solid", cfg["T_solid_arr"], [("Density", cfg["rho_solid_arr"], "kg/m³"), ("Cp", cfg["cp_solid_arr"], "J/kgK"), ("k", cfg["k_solid_arr"], "W/mK"), ("Mu", cfg["mu_solid_arr"], "Pa·s")]))
-    h.append(_html_prop_arrays("Liquid", cfg["T_liquid_arr"], [("Density", cfg["rho_liquid_arr"], "kg/m³"), ("Cp", cfg["cp_liquid_arr"], "J/kgK"), ("k", cfg["k_liquid_arr"], "W/mK"), ("Mu", cfg["mu_liquid_arr"], "Pa·s")]))
+    
+    # Sample 6 points to display in the HTML table
+    c_T, c_rho, c_cp, c_mu, c_k = _sample_arrays(cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"])
+    t_T, t_rho, t_cp, t_mu, t_k = _sample_arrays(mat["T_grid"], mat["rho_grid"], mat["cp_sens_grid"], mat["mu_grid"], mat["k_grid"])
+    w_T, w_rho, w_cp, _, w_k = _sample_arrays(cfg["T_wall_arr"], cfg["rho_wall_arr"], cfg["cp_wall_arr"], np.zeros_like(cfg["T_wall_arr"]), cfg["k_wall_arr"])
+    tb_T, tb_rho, tb_cp, _, tb_k = _sample_arrays(cfg["T_tube_arr"], cfg["rho_tube_arr"], cfg["cp_tube_arr"], np.zeros_like(cfg["T_tube_arr"]), cfg["k_tube_arr"])
+
+    h.append(f"<h3>Coil Fluid: {cfg['fluid_name']}</h3>" + _html_prop_arrays("Coil", c_T, [("Density", c_rho, "kg/m³"), ("Cp", c_cp, "J/kgK"), ("Mu", c_mu, "Pa·s"), ("k", c_k, "W/mK")]))
+    h.append(f"<h3>Tank Fluid: {cfg['tank_name']}</h3>" + _html_prop_arrays("Tank", t_T, [("Density", t_rho, "kg/m³"), ("Cp", t_cp, "J/kgK"), ("Mu", t_mu, "Pa·s"), ("k", t_k, "W/mK")]))
+    h.append(f"<h3>Tank Wall: {cfg['wall_name']}</h3>" + _html_prop_arrays("Wall", w_T, [("Density", w_rho, "kg/m³"), ("Cp", w_cp, "J/kgK"), ("k", w_k, "W/mK")]))
+    h.append(f"<h3>Coil Tube: {cfg['coil_mat']}</h3>" + _html_prop_arrays("Tube", tb_T, [("Density", tb_rho, "kg/m³"), ("Cp", tb_cp, "J/kgK"), ("k", tb_k, "W/mK")]))
 
     h.append("<h3>Geometry & Operating</h3>" + _html_table([
         ("Inner radius", f"{cfg['r_inner']:.4f} m"),
@@ -270,7 +298,6 @@ def write_report_html(outdir, cfg, R_ag, n_ag, results_2d=None):
         ("Environment (for heat loss)", f"{cfg['T_amb_mid']:.1f} °C"),
         ("Wall", f"{cfg['wall_name']}, t={cfg['t_wall']*1000:.1f} mm"),
         ("Insulation", f"t={cfg['t_ins']*1000:.0f} mm, U={cfg['h_air']:.1f} W/m²K"),
-        ("Agitator", f"Type {cfg['ag_type']} @ {cfg['N_rpm']} RPM" if cfg['has_agitator'] else "None"),
         ("Windows", f"Heating {cfg['t_window_hr']:.2f} h, Cooldown {cfg['t_cooldown_hr']:.2f} h"),
         ("Cycles", f"{cfg['N_cycles']}")
     ]))
