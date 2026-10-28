@@ -6,26 +6,25 @@ import sys
 import outputs
 from .heat_transfer import is_flowable, h_internal, h_external, calc_Q
 
-# ------------------------------------------------------------
-# CYCLE KERNEL (Physics for ONE cycle)
-# ------------------------------------------------------------
 @njit(cache=True)
 def cycle_kernel(
         mass, enthalpy, N_r, N_z, dr, dz, 
         coil_w, R_coil, A_coil_total, d_in, d_out, R_f_out, m_dot_coil,
         drain_r, drain_z, drain_area,
         fill_w, fill_theta_frac, fill_z, fill_mdot, fill_T, fill_mode,
-        T_water_in, T_ms, T_me, thresh_liq, thresh_visc, # <-- Removed Hfus here
+        T_water_in, T_ms, T_me, thresh_liq, thresh_visc,
         T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid,
         T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
         T_tube_arr, k_tube_arr, 
-        dt, n_steps_heat, n_steps_cool, do_cool, n_cycles, T_amb, U_tank_air,
+        dt, n_steps_heat, n_steps_cool, do_cool, n_cycles, T_amb,
+        T_wall_arr, rho_wall_arr, cp_wall_arr, k_wall_arr, t_wall, t_ins, k_ins, h_air,
         K_settle, beta, dT_natural,
         drained_mass_cum_in, filled_mass_cum_in, idle_time_in,
         first_drain_time_in, last_drain_time_in, stranded_prev_in,
-        snapshot_interval_steps):
+        T_steel_in, snapshot_interval_steps):
     
     n_steps = n_steps_heat + (n_steps_cool if do_cool else 0)
+    T_steel = T_steel_in.copy()
     
     time_log = np.zeros(n_steps)
     drain_log = np.zeros(n_steps)
@@ -86,28 +85,18 @@ def cycle_kernel(
                     surf[i] = j
                     break
 
-        # 2. Coil Heating
+        # 2. Coil Heating (Per-cell NTU)
         if is_heating:
-            T_coil_avg = 0.0; weight_sum = 0.0
+            d_coil_actual = 2.0 * R_coil
             for i in range(N_r):
                 for j in range(N_z):
                     if coil_w[i, j] > 1e-6 and mass[i, j] > 1e-6:
-                        T_coil_avg += T[i, j] * coil_w[i, j]
-                        weight_sum += coil_w[i, j]
-            if weight_sum > 0.0:
-                T_coil_avg /= weight_sum
-                d_coil_actual = 2.0 * R_coil
-                
-                H_coil_avg = np.interp(T_coil_avg, T_grid, H_grid)
-                
-                q_total = calc_Q(m_dot_coil, T_coil_avg, H_coil_avg, T_water_in, d_in, d_out, R_f_out, A_coil_total, d_coil_actual,
-                                 T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
-                                 T_tube_arr, k_tube_arr, T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc,
-                                 beta, dT_natural)
-                for i in range(N_r):
-                    for j in range(N_z):
-                        if coil_w[i, j] > 1e-6 and mass[i, j] > 1e-6:
-                            enthalpy[i, j] += q_total * (coil_w[i, j] / weight_sum) * dt
+                        H_spec = enthalpy[i, j] / mass[i, j]
+                        q_local = calc_Q(m_dot_coil, T[i, j], H_spec, T_water_in, d_in, d_out, R_f_out, A_coil_total * coil_w[i, j], d_coil_actual,
+                                         T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
+                                         T_tube_arr, k_tube_arr, T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc,
+                                         beta, dT_natural)
+                        enthalpy[i, j] += q_local * dt
 
         # 3. 2D Conduction
         for i in range(N_r):
@@ -124,16 +113,17 @@ def cycle_kernel(
                     area = 2.0 * np.pi * ((i+1) * dr) * dz
                     q = k_avg * area * (T[i, j] - T[i+1, j]) / dr
                     enthalpy[i, j] -= q * dt
+                    
                 if j > 0 and mass[i, j-1] > 1e-6:
                     k_avg = 0.5 * (k_here + np.interp(T[i, j-1], T_grid, k_grid))
                     if T[i, j-1] > T[i, j]: k_avg *= 50.0
-                    area = 2.0 * np.pi * (i * dr) * dr
+                    area = V_cell[i, j] / dz  # FIX 8a: Annulus area
                     q = k_avg * area * (T[i, j] - T[i, j-1]) / dz
                     enthalpy[i, j] -= q * dt
                 if j < N_z - 1 and mass[i, j+1] > 1e-6:
                     k_avg = 0.5 * (k_here + np.interp(T[i, j+1], T_grid, k_grid))
                     if T[i, j] > T[i, j+1]: k_avg *= 50.0
-                    area = 2.0 * np.pi * (i * dr) * dr
+                    area = V_cell[i, j] / dz  # FIX 8a: Annulus area
                     q = k_avg * area * (T[i, j] - T[i, j+1]) / dz
                     enthalpy[i, j] -= q * dt
 
@@ -300,12 +290,31 @@ def cycle_kernel(
                     enthalpy[i+1, j] -= moved * h_spec
                     enthalpy[i, j] += moved * h_spec
 
-        # 8. Wall Loss
+                # 8. Wall Loss (Lumped Steel Node)
+        r_boundary = (N_r - 1) * dr
+        A_face = 2.0 * np.pi * r_boundary * dz
+        A_outer = 2.0 * np.pi * (r_boundary + t_wall) * dz
+        V_node = np.pi * ((r_boundary + t_wall)**2 - r_boundary**2) * dz
+        
         for j in range(N_z):
             if mass[N_r-1, j] > 1e-6:
-                area = 2.0 * np.pi * ((N_r - 1) * dr) * dz
-                q_loss = U_tank_air * area * (T[N_r-1, j] - T_amb)
-                enthalpy[N_r-1, j] -= q_loss * dt
+                k_wall_now = np.interp(T_steel[j], T_wall_arr, k_wall_arr)
+                cp_wall_now = np.interp(T_steel[j], T_wall_arr, cp_wall_arr)
+                rho_wall_now = np.interp(T_steel[j], T_wall_arr, rho_wall_arr)
+                
+                # Heat fluid -> wall
+                q_fw = (k_wall_now / (t_wall/2.0)) * A_face * (T[N_r-1, j] - T_steel[j])
+                enthalpy[N_r-1, j] -= q_fw * dt
+                
+                # Heat wall -> ambient
+                R_conv = 1.0 / h_air
+                R_ins = (t_ins / k_ins) if t_ins > 0 else 0.0
+                U_air = 1.0 / (R_ins + R_conv)
+                q_wa = U_air * A_outer * (T_steel[j] - T_amb)
+                
+                # Update wall temp
+                M_node = rho_wall_now * V_node
+                T_steel[j] += (q_fw - q_wa) * dt / (M_node * cp_wall_now)
 
         if not is_heating: status_log[step] = -1
         elif did_drain and did_fill: status_log[step] = 3
@@ -313,7 +322,7 @@ def cycle_kernel(
         elif did_fill: status_log[step] = 2
         else: status_log[step] = 0
 
-        # Capture Snapshots (Hourly + End of Heating)
+        # Capture Snapshots
         if (step % snapshot_interval_steps == 0) or (is_heating and step == n_steps_heat - 1):
             if snap_count < max_snaps:
                 if snap_count > 0 and abs(snapshot_times[snap_count-1] - time_log[step]) < 1e-4:
@@ -362,7 +371,7 @@ def cycle_kernel(
     return (mass, enthalpy, T_snapshots, M_snapshots, snapshot_times, snap_count, time_log, drain_log, fill_log, status_log, is_heating_log,
             drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
             cycle_start_mass, cycle_remaining_mass, cycle_extracted, cycle_filled, cycle_idle_hr,
-            m_sol, m_slu, m_liq, cyc_sol_T, cyc_slu_T, cyc_liq_T, avg_T_ext)
+            m_sol, m_slu, m_liq, cyc_sol_T, cyc_slu_T, cyc_liq_T, avg_T_ext, T_steel)
 
 # ------------------------------------------------------------
 # DRIVER FUNCTION
@@ -467,12 +476,6 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
     drain_area = np.pi * (drain_diameter / 2.0)**2
     A_coil_total = 2.0 * np.pi * R_coil * n_turns * cfg["d_out"]
     
-    k_wall = float(np.interp(cfg["T_water_in"], cfg["T_wall_arr"], cfg["k_wall_arr"]))
-    R_wall_half = (cfg["t_wall"]/2.0) / max(1e-6, k_wall)
-    R_ins = (cfg["t_ins"]/max(1e-6, cfg["k_ins"])) if cfg["t_ins"] > 0 else 0.0
-    R_conv = 1.0 / max(1e-6, cfg["h_air"])
-    U_tank_air = 1.0 / max(1e-6, R_wall_half + R_ins + R_conv)
-    
     n_cycles = max(1, cfg["N_cycles"])
     n_steps_heat = max(1, int(cfg["t_window_hr"] * 3600.0 / max(1e-6, cfg["dt_sec"])))
     n_steps_cool = max(1, int(cfg["t_cooldown_hr"] * 3600.0 / max(1e-6, cfg["dt_sec"])))
@@ -493,6 +496,9 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
                 if T_curr > cfg["T_me"]:
                     stranded_prev += mass[i, j]
 
+    # Initialize T_steel (Lumped steel node for the outer wall)
+    T_steel = np.full(N_z, cfg["T_amb_mid"])
+
     results_2d = {
         "cycle_metrics": [],
         "dt_sec": cfg["dt_sec"],
@@ -512,20 +518,21 @@ def run_2d_simulation(cfg, mat, R_coil, n_turns, initial_1d_state, drain_diamete
         
         (mass, enthalpy, T_snaps, M_snaps, snap_times, snap_count, t_log, d_log, f_log, s_log, h_log,
          drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
-         start_m, rem_m, ext_kg, fil_kg, idle_h, m_sol, m_slu, m_liq, T_sol, T_slu, T_liq, avg_T_ext) = cycle_kernel(
+         start_m, rem_m, ext_kg, fil_kg, idle_h, m_sol, m_slu, m_liq, T_sol, T_slu, T_liq, avg_T_ext, T_steel) = cycle_kernel(
             mass, enthalpy, N_r, N_z, dr, dz, 
             coil_w, R_coil, A_coil_total, cfg["d_in"], cfg["d_out"], cfg["R_f_out"], 
             cfg["flow_m3h"] * float(np.interp(cfg["T_water_in"], cfg["T_water_arr"], cfg["rho_water_arr"])) / 3600.0,
             drain_r_idx, drain_z_idx, drain_area,
             fill_w, fill_theta_frac, fill_z_idx, fill_mdot, fill_T, fill_mode,
-            cfg["T_water_in"], cfg["T_ms"], cfg["T_me"], cfg["thresh_liq"], cfg["thresh_visc"], # <-- Removed cfg["Hfus"]
+            cfg["T_water_in"], cfg["T_ms"], cfg["T_me"], cfg["thresh_liq"], cfg["thresh_visc"],
             mat["T_grid"], mat["H_grid"], mat["rho_grid"], mat["cp_sens_grid"], mat["k_grid"], mat["mu_grid"],
             cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"],
             cfg["T_tube_arr"], cfg["k_tube_arr"],
-            cfg["dt_sec"], n_steps_heat, n_steps_cool, do_cool, n_cycles, cfg["T_amb_mid"], U_tank_air,
+            cfg["dt_sec"], n_steps_heat, n_steps_cool, do_cool, n_cycles, cfg["T_amb_mid"],
+            cfg["T_wall_arr"], cfg["rho_wall_arr"], cfg["cp_wall_arr"], cfg["k_wall_arr"], cfg["t_wall"], cfg["t_ins"], cfg["k_ins"], cfg["h_air"],
             cfg["K_settle"], cfg["beta_liq"], cfg["dT_natural"],
             drained_mass_cum, filled_mass_cum, idle_time, first_drain_time, last_drain_time, stranded_prev,
-            snapshot_interval_steps
+            T_steel, snapshot_interval_steps
         )
 
         time_log_all.append(t_log)

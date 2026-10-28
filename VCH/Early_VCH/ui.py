@@ -158,13 +158,17 @@ def gather_2d_inputs(cfg, mat_tank):
 
     cfg["T_start"] = T_start
 
+    # Dynamically set the max index based on the current 2D grid resolution.
+    # In engine_2d.py, res = 5, N_r = 10*res = 50. So indices go from 0 to 49.
+    max_idx = 49 
+
     print("\n--- 2D Drain Setup ---")
     cfg["simulate_drain"] = input("  Do you want to simulate continuous draining? [y/N]: ").strip().lower() in ("y", "yes")
     if cfg["simulate_drain"]:
         cfg["drain_diameter"] = pf("    Drain valve diameter (m)", default=0.05, lo=0.001, hi=1.0)
-        cfg["drain_r_idx"] = pi_prompt("    Drain radial index (0=center, 49=wall)", default=0, lo=0, hi=49)
+        cfg["drain_r_idx"] = pi_prompt(f"    Drain radial index (0=center, {max_idx}=wall)", default=0, lo=0, hi=max_idx)
         cfg["drain_angle"] = pf("    Drain angular position (0-360)", default=0.0, lo=0.0, hi=360.0) if cfg["drain_r_idx"] > 0 else 0.0
-        cfg["drain_z_idx"] = pi_prompt("    Drain axial index (0=bottom, 49=top)", default=0, lo=0, hi=49)
+        cfg["drain_z_idx"] = pi_prompt(f"    Drain axial index (0=bottom, {max_idx}=top)", default=0, lo=0, hi=max_idx)
     else:
         cfg.update({"drain_diameter": 0.0, "drain_r_idx": 0, "drain_z_idx": 0, "drain_angle": 0.0})
 
@@ -174,12 +178,12 @@ def gather_2d_inputs(cfg, mat_tank):
         cfg["fill_diameter"] = pf("    Fill nozzle diameter (m)", default=0.05, lo=0.001, hi=1.0)
         cfg["fill_flow_m3h"] = pf("    Fill volumetric flow rate (m3/h)", default=1.0, lo=0.01, hi=100.0)
         cfg["fill_T"] = pf("    Fill fluid temperature degC", default=cfg["T_amb_mid"])
-        cfg["fill_r_idx"] = pi_prompt("    Fill radial index (0=center, 49=wall)", default=0, lo=0, hi=49)
+        cfg["fill_r_idx"] = pi_prompt(f"    Fill radial index (0=center, {max_idx}=wall)", default=0, lo=0, hi=max_idx)
         cfg["fill_angle"] = pf("    Fill angular position (0-360)", default=0.0, lo=0.0, hi=360.0) if cfg["fill_r_idx"] > 0 else 0.0
-        cfg["fill_z_idx"] = pi_prompt("    Fill axial index (0=bottom, 49=top)", default=49, lo=0, hi=49)
+        cfg["fill_z_idx"] = pi_prompt(f"    Fill axial index (0=bottom, {max_idx}=top)", default=max_idx, lo=0, hi=max_idx)
         cfg["fill_mode"] = int(pc("    Fill behaviour:", [("0", "Constant"), ("1", "Heating only"), ("2", "Cooling only")]))
     else:
-        cfg.update({"fill_diameter": 0.0, "fill_flow_m3h": 0.0, "fill_T": cfg["T_amb_mid"], "fill_r_idx": 0, "fill_z_idx": 49, "fill_mode": 0, "fill_angle": 0.0})
+        cfg.update({"fill_diameter": 0.0, "fill_flow_m3h": 0.0, "fill_T": cfg["T_amb_mid"], "fill_r_idx": 0, "fill_z_idx": max_idx, "fill_mode": 0, "fill_angle": 0.0})
 
     return cfg
 

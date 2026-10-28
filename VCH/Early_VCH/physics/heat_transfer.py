@@ -5,7 +5,7 @@ from numba import njit
 @njit(inline='always')
 def is_flowable(T, H, T_grid, H_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc):
     if np.isnan(T_ms) or np.isnan(T_me):
-        return True # Single-phase fluid is always flowable
+        return True
         
     H_solid = np.interp(T_ms, T_grid, H_grid)
     H_liquid = np.interp(T_me, T_grid, H_grid)
