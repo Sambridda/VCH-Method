@@ -57,6 +57,7 @@ class PhaseAWorker(QThread):
     def __init__(self, cfg, outdir): 
         super().__init__()
         self.cfg, self.outdir = cfg, outdir
+        self.cancel_event = threading.Event()
     def run(self):
         try:
             cfg = self.cfg
@@ -69,10 +70,12 @@ class PhaseAWorker(QThread):
             
             cold_rows = run_cold_sweep(cfg, mat, geom, presets,
                                        progress=lambda d, t, m: self.progress.emit(d, t, m), 
-                                       monitor=mon)
+                                       cancel=self.cancel_event, monitor=mon)
                                        
             menu = post.write_phase_a(self.outdir, cfg, cold_rows, geom, radii, presets)
             self.done.emit(dict(mat=mat, geom=geom, radii=radii, presets=presets, cold_rows=cold_rows, menu=menu))
+        except Cancelled:
+            pass
         except Exception: 
             self.failed.emit(traceback.format_exc())
 
@@ -83,17 +86,19 @@ class PhaseCDWorker(QThread):
     def __init__(self, cfg, study, choice, outdir): 
         super().__init__()
         self.cfg, self.study, self.choice, self.outdir = cfg, study, choice, outdir
+        self.cancel_event = threading.Event() 
 
     def run(self):
         try:
             R, n = self.choice["R"], self.choice["n"]
             
+            self.progress.emit(0, 100, "Compiling 2D engine and starting simulation... (Check terminal for progress)")
+            
             res = run_2d_simulation(
                 self.cfg, self.study["mat"], R, n, None, 
                 drain_diameter=self.cfg["drain_diameter"],
                 drain_location=(int(self.cfg["drain_r_idx"]), int(self.cfg["drain_z_idx"])),
-                outdir=self.outdir,
-                progress_callback=lambda d, t, m: self.progress.emit(d, t, m)
+                outdir=self.outdir
             )
             
             html_path = post.write_report_html(
@@ -102,7 +107,7 @@ class PhaseCDWorker(QThread):
                 results_2d=res
             )
             
-            res["text"] = f"2D Draining Simulation Complete.\n\nTotal Time: {res['total_hr']:.1f} h\nTotal Drained: {res['total_extracted_kg']:.1f} kg\nFinal Mass: {res['final_mass']:.1f} kg\n\nSee the HTML report and the graph tabs for full details."
+            res["text"] = f"2D Draining Simulation Complete.\n\nTotal Time: {res['total_hr']:.1f} h\nTotal Drained: {res['total_extracted_kg']:.1f} kg\nFinal Mass: {res.get('final_mass', 0):.1f} kg\n\nSee the HTML report and the graph tabs for full details."
             res["index_html"] = html_path
             res["R"] = R
             res["n"] = n
@@ -120,8 +125,9 @@ class ScaledImage(QtWidgets.QLabel):
         super().__init__()
         self._pm = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Ignored)
-        self.setMinimumSize(160, 120)
+        # We use Expanding to let the layout give it room
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(300, 200) # Force it to have a base size
     def set_image(self, path):
         self._pm = QtGui.QPixmap(str(path))
         self._rescale()
@@ -131,15 +137,6 @@ class ScaledImage(QtWidgets.QLabel):
     def resizeEvent(self, e):
         self._rescale()
         super().resizeEvent(e)
-
-def image_tabs(names, folder):
-    tabs = QtWidgets.QTabWidget()
-    for name in names:
-        img = ScaledImage()
-        p = Path(folder) / name
-        if p.exists(): img.set_image(p)
-        tabs.addTab(img, name.replace(".png", ""))
-    return tabs
 
 def open_path(path):
     QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
@@ -317,8 +314,6 @@ class ProgressPage(QtWidgets.QWidget):
 # MAIN WINDOW
 # ============================================================
 class MainWindow(QtWidgets.QMainWindow):
-    TAB_INPUTS, TAB_A, TAB_PICK, TAB_RESULTS = range(4)
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VCH Framework")
@@ -502,27 +497,85 @@ class MainWindow(QtWidgets.QMainWindow):
         head.setTextFormat(Qt.TextFormat.RichText); head.setWordWrap(True)
         self.results_lay.addWidget(head)
 
-        text = QtWidgets.QPlainTextEdit(res["text"])
+        text = QtWidgets.QPlainTextEdit(res.get("text", ""))
         text.setReadOnly(True)
         text.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
         text.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         
-        tabs = QtWidgets.QTabWidget()
-        if "curve_path" in res: tabs.addTab(self._img(res["curve_path"]), "Drain Curve")
+        main_tabs = QtWidgets.QTabWidget()
+
+        # 1. Overall Summary Tab
+        overall_tab = QtWidgets.QWidget()
+        overall_lay = QtWidgets.QVBoxLayout(overall_tab)
         
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll_content = QtWidgets.QWidget()
+        scroll_lay = QtWidgets.QVBoxLayout(scroll_content)
+        
+        title = QtWidgets.QLabel("<h2>Panel 2 — Final Summary</h2>")
+        title.setStyleSheet("color: #1a4d7a; font-weight: bold;")
+        scroll_lay.addWidget(title)
+
+        if "drain_summary" in res:
+            ds = res["drain_summary"]
+            scroll_lay.addWidget(QtWidgets.QLabel("<h3>Drain Summary</h3>"))
+            
+            table = QtWidgets.QTableWidget(5, 2)
+            table.setHorizontalHeaderLabels(["Metric", "Value"])
+            table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            
+            fd = f"{ds.get('first_drain', -1):.2f} h" if ds.get('first_drain', -1) >= 0 else "Never"
+            ld = f"{ds.get('last_drain', -1):.2f} h" if ds.get('last_drain', -1) >= 0 else "Never"
+            
+            data = [
+                ("First drain activated", fd),
+                ("Drain stopped completely", ld),
+                ("Total Drained", f"{ds.get('total_drained', 0):.1f} kg"),
+                ("Total Filled", f"{ds.get('total_filled', 0):.1f} kg"),
+                ("Total Remaining", f"{ds.get('total_remaining', 0):.1f} kg"),
+            ]
+            
+            for row, (label, val) in enumerate(data):
+                table.setItem(row, 0, QtWidgets.QTableWidgetItem(label))
+                table.setItem(row, 1, QtWidgets.QTableWidgetItem(val))
+                table.item(row, 0).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                table.item(row, 1).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                
+            table.setFixedHeight(5 * 30 + 30)
+            table.setMaximumWidth(400)
+            scroll_lay.addWidget(table)
+
+        if "final_mass_flow_path" in res:
+            scroll_lay.addWidget(QtWidgets.QLabel("<h3>Mass Flow Curve (Drain & Fill)</h3>"))
+            img = self._img(res["final_mass_flow_path"])
+            img.setMinimumHeight(300) # Force size to prevent overlap
+            scroll_lay.addWidget(img)
+            
+        if "final_timeline_path" in res:
+            scroll_lay.addWidget(QtWidgets.QLabel("<h3>Timeline</h3>"))
+            img = self._img(res["final_timeline_path"])
+            img.setMinimumHeight(150) # Force size to prevent overlap
+            scroll_lay.addWidget(img)
+            
+        scroll_lay.addStretch()
+        scroll.setWidget(scroll_content)
+        overall_lay.addWidget(scroll)
+        
+        main_tabs.addTab(overall_tab, "Overall Summary")
+
+        # 2. Cycle Tabs
         for idx, m in enumerate(res.get("cycle_metrics", [])):
-            c_tabs = QtWidgets.QTabWidget()
-            if idx < len(res.get("heatmap_paths", [])): c_tabs.addTab(self._img(res["heatmap_paths"][idx]), "Lateral Temp")
-            if idx < len(res.get("massmap_paths", [])): c_tabs.addTab(self._img(res["massmap_paths"][idx]), "Lateral Mass")
-            if idx < len(res.get("topmass_paths", [])): c_tabs.addTab(self._img(res["topmass_paths"][idx]), "Top-Down Mass")
-            if idx < len(res.get("toptemp_paths", [])): c_tabs.addTab(self._img(res["toptemp_paths"][idx]), "Top-Down Temp")
-            if idx < len(res.get("phasebar_paths", [])): c_tabs.addTab(self._img(res["phasebar_paths"][idx]), "Phase Dist")
-            tabs.addTab(c_tabs, f"Cycle {m['cycle']}")
+            cycle_tab = self._build_cycle_tab(res, idx, m)
+            main_tabs.addTab(cycle_tab, f"Cycle {m['cycle']}")
 
         split = QtWidgets.QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(text)
-        split.addWidget(tabs)
-        text.setMinimumWidth(430); split.setStretchFactor(0, 0); split.setStretchFactor(1, 1); split.setSizes([400, 740])
+        split.addWidget(main_tabs)
+        text.setMinimumWidth(350); split.setStretchFactor(0, 0); split.setStretchFactor(1, 1); split.setSizes([300, 840])
         self.results_lay.addWidget(split, 1)
 
         bar = QtWidgets.QHBoxLayout()
@@ -537,8 +590,102 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addStretch(); bar.addWidget(b_new)
         self.results_lay.addLayout(bar)
 
+    def _build_cycle_tab(self, res, idx, cycle_metric):
+        cycle_widget = QtWidgets.QWidget()
+        cycle_lay = QtWidgets.QVBoxLayout(cycle_widget)
+        inner_tabs = QtWidgets.QTabWidget()
+
+        # A. Hourly Snapshots Tab
+        hourly_widget = QtWidgets.QWidget()
+        hourly_lay = QtWidgets.QHBoxLayout(hourly_widget)
+        
+        hour_list = QtWidgets.QListWidget()
+        hour_list.setMinimumWidth(250)
+        hour_list.setMaximumWidth(350)
+        
+        image_stack = QtWidgets.QStackedWidget()
+        
+        h_heatmaps = res.get("hourly_heatmap_paths", [])
+        h_massmaps = res.get("hourly_massmap_paths", [])
+        cycle_heatmaps = h_heatmaps[idx] if idx < len(h_heatmaps) else []
+        cycle_massmaps = h_massmaps[idx] if idx < len(h_massmaps) else []
+        
+        if not cycle_heatmaps:
+            hour_list.addItem("No hourly snapshots generated.")
+            image_stack.addWidget(QtWidgets.QLabel("Backend did not save hourly images.\nTry setting heating window to >= 2 hours."))
+        else:
+            for h_idx in range(len(cycle_heatmaps)):
+                item = QtWidgets.QListWidgetItem(f"Hour {h_idx + 1} (T = {h_idx} h)")
+                hour_list.addItem(item)
+                
+                hour_page = QtWidgets.QWidget()
+                page_lay = QtWidgets.QHBoxLayout(hour_page)
+                page_lay.addWidget(self._img(cycle_heatmaps[h_idx]))
+                if h_idx < len(cycle_massmaps):
+                    page_lay.addWidget(self._img(cycle_massmaps[h_idx]))
+                image_stack.addWidget(hour_page)
+                
+            hour_list.currentRowChanged.connect(image_stack.setCurrentIndex)
+
+        hourly_lay.addWidget(hour_list)
+        hourly_lay.addWidget(image_stack, 1)
+        inner_tabs.addTab(hourly_widget, "Hourly Snapshots")
+
+        # B. Cycle Summary Tab
+        summary_widget = QtWidgets.QWidget()
+        summary_lay = QtWidgets.QVBoxLayout(summary_widget)
+        
+        table = QtWidgets.QTableWidget(8, 2)
+        table.setHorizontalHeaderLabels(["Metric", "Value"])
+        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        
+        start_m = cycle_metric.get('start_mass', 0)
+        end_m = cycle_metric.get('end_mass', 0)
+        ext_m = cycle_metric.get('extracted_kg', 0)
+        ext_t = cycle_metric.get('extracted_temp', 0)
+        eff = cycle_metric.get('drain_efficiency', 0)
+        util = cycle_metric.get('drain_util', 0)
+        fill_m = cycle_metric.get('fill_mass', 0)
+        fill_u = cycle_metric.get('fill_util', 0)
+
+        data = [
+            ("Fluid in tank (start of heating)", f"{start_m:.1f} kg"),
+            ("Fluid in tank (end of heating)", f"{end_m:.1f} kg"),
+            ("Fluid extracted via drain", f"{ext_m:.1f} kg"),
+            ("Average extracted temperature", f"{ext_t:.1f} °C" if ext_t > 0 else "—"),
+            ("Drain efficiency", f"{eff:.1f} %"),
+            ("Drain utilisation", f"{util:.1f} %"),
+            ("Fluid added via fill", f"{fill_m:.1f} kg"),
+            ("Fill utilisation", f"{fill_u:.1f} %"),
+        ]
+        
+        for row, (label, val) in enumerate(data):
+            table.setItem(row, 0, QtWidgets.QTableWidgetItem(label))
+            table.setItem(row, 1, QtWidgets.QTableWidgetItem(val))
+            table.item(row, 0).setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            table.item(row, 1).setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            
+        table.setFixedHeight(8 * 30 + 30) 
+        summary_lay.addWidget(table)
+
+        summary_imgs = QtWidgets.QTabWidget()
+        if idx < len(res.get("topmass_paths", [])): summary_imgs.addTab(self._img(res["topmass_paths"][idx]), "Top-Down Mass")
+        if idx < len(res.get("phasebar_paths", [])): summary_imgs.addTab(self._img(res["phasebar_paths"][idx]), "Phase Dist")
+        
+        summary_lay.addWidget(summary_imgs, 1)
+        inner_tabs.addTab(summary_widget, "Cycle Summary")
+
+        cycle_lay.addWidget(inner_tabs)
+        return cycle_widget
+
     def _img(self, p):
-        l = ScaledImage(); l.set_image(p)
+        l = ScaledImage()
+        if p and os.path.exists(p):
+            l.set_image(p)
+        else:
+            l.setText("Image not found")
         return l
 
     def _failed(self, tb):
@@ -555,7 +702,6 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion"); app.setStyleSheet(STYLE)
     
-    # COMPILE THE 2D KERNEL HERE BEFORE THE UI SHOWS
     warm_up_2d() 
     
     win = MainWindow()

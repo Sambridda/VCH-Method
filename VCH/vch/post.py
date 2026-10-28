@@ -10,7 +10,7 @@ from .geometry import coil_properties, coil_index
 CSV_KEYS = ["phase", "preset", "T_amb", "start_type", "R", "R_ratio", "n", "L_coil", "A_coil",
             "liquid_0", "slurry_0", "solid_0", "liquid", "slurry", "solid", "liquid_change",
             "liquid_T", "slurry_T", "solid_T", "peak_oil", "energy_kWh", "peak_power_kW"]
-PNG_NAMES = ["cold_low.png", "cold_mid.png", "cold_hot.png", "hot_start.png", "selected_summary.png"]
+PNG_NAMES = ["cold_low.png", "cold_mid.png", "cold_hot.png"]
 CRLF = "\r\n"
 
 def _viridis(n):
@@ -83,7 +83,10 @@ def _html_prop_arrays(name, T_arr, props):
     h.append("</table>"); return "\n".join(h)
 
 def _png_data_uri(path):
-    with open(path, "rb") as f: return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+    if not path or not os.path.exists(path): 
+        return ""
+    with open(path, "rb") as f: 
+        return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
 
 def _T_band(r, cfg, mat, R_ag):
     return float(np.interp(np.array(r["H_final"])[coil_index(cfg, R_ag)], mat["H_grid"], mat["T_grid"]))
@@ -112,7 +115,6 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
     h.append("<h3>Geometry & Operating</h3>" + _html_table([
         ("Inner radius", f"{cfg['r_inner']:.4f} m"), ("Fluid mass (requested)", f"{cfg['M_fluid']:.0f} kg"),
         ("Starting tank temperature", f"{cfg.get('T_start', cfg['T_amb_mid']):.1f} °C"),
-        ("Effective mass at T_start", f"{cfg.get('M_fluid_effective', cfg['M_fluid']):.0f} kg"),
         ("Environment (for heat loss)", f"{cfg['T_amb_mid']:.1f} °C"),
         ("Wall", f"{cfg['wall_name']}, t={cfg['t_wall']*1000:.1f} mm"),
         ("Insulation", f"t={cfg['t_ins']*1000:.0f} mm, U={cfg['h_air']:.1f} W/m²K"),
@@ -128,37 +130,68 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
 
     if results_2d is not None:
         h.append("<h2>3. Simulation Results</h2>")
-        h.append(f"<p><b>Total Simulation Time:</b> {results_2d['total_hr']:.1f} h</p>")
-        h.append("<h3>Extraction Curve</h3>")
-        h.append(f"<img src='{_png_data_uri(results_2d['curve_path'])}' alt='curve'>")
+        h.append(f"<p><b>Total Simulation Time:</b> {results_2d.get('total_hr', 0):.1f} h</p>")
         
-        first_t = f"{results_2d['first_drain']:.2f} h" if results_2d['first_drain'] >= 0 else "Never"
-        last_t = "Never" if results_2d['last_drain'] < 0 else f"{results_2d['last_drain']:.2f} h"
+        h.append("<h3>Extraction Curve</h3>")
+        curve_uri = _png_data_uri(results_2d.get('curve_path'))
+        if curve_uri: h.append(f"<img src='{curve_uri}' alt='curve'>")
+        
+        # SAFE GET for missing keys
+        fd_val = results_2d.get('first_drain', -1)
+        ld_val = results_2d.get('last_drain', -1)
+        
+        first_t = f"{fd_val:.2f} h" if fd_val >= 0 else "Never"
+        last_t = "Never" if ld_val < 0 else f"{ld_val:.2f} h"
+        
         h.append("<table>")
         h.append(f"<tr><td>First drain activated</td><td>{first_t}</td></tr>")
         h.append(f"<tr><td>Drain stopped completely</td><td>{last_t}</td></tr>")
-        h.append(f"<tr><td>Total Drained</td><td>{results_2d['total_extracted_kg']:.1f} kg</td></tr>")
-        h.append(f"<tr><td>Total Remaining</td><td>{results_2d['final_mass']:.1f} kg</td></tr>")
+        h.append(f"<tr><td>Total Drained</td><td>{results_2d.get('total_extracted_kg', 0):.1f} kg</td></tr>")
+        h.append(f"<tr><td>Total Remaining</td><td>{results_2d.get('final_mass', 0):.1f} kg</td></tr>")
         h.append("</table>")
 
         h.append("<h2>Panel 1 — Cycle Details</h2>")
-        for idx, m in enumerate(results_2d["cycle_metrics"]):
+        for idx, m in enumerate(results_2d.get("cycle_metrics", [])):
             h.append(f"<h3>Cycle {m['cycle']}</h3>")
+            
+            lat_temp_uri = _png_data_uri(results_2d['heatmap_paths'][idx]) if idx < len(results_2d.get('heatmap_paths', [])) else ""
+            lat_mass_uri = _png_data_uri(results_2d['massmap_paths'][idx]) if idx < len(results_2d.get('massmap_paths', [])) else ""
+            top_mass_uri = _png_data_uri(results_2d['topmass_paths'][idx]) if idx < len(results_2d.get('topmass_paths', [])) else ""
+            top_temp_uri = _png_data_uri(results_2d['toptemp_paths'][idx]) if idx < len(results_2d.get('toptemp_paths', [])) else ""
+            phase_dist_uri = _png_data_uri(results_2d['phasebar_paths'][idx]) if idx < len(results_2d.get('phasebar_paths', [])) else ""
+
             h.append("<div class='imgrow'>"
-                     f"<div><h4>Lateral Temperature</h4><img src='{_png_data_uri(results_2d['heatmap_paths'][idx])}'></div>"
-                     f"<div><h4>Lateral Mass Distribution</h4><img src='{_png_data_uri(results_2d['massmap_paths'][idx])}'></div>"
+                     f"<div><h4>Lateral Temperature</h4><img src='{lat_temp_uri}'></div>"
+                     f"<div><h4>Lateral Mass Distribution</h4><img src='{lat_mass_uri}'></div>"
                      "</div>")
+            
             h.append("<div class='imgrow'>"
-                     f"<div><h4>Top-Down Total Mass</h4><img src='{_png_data_uri(results_2d['topmass_paths'][idx])}'></div>"
-                     f"<div><h4>Top-Down Surface Temp</h4><img src='{_png_data_uri(results_2d['toptemp_paths'][idx])}'></div>"
+                     f"<div><h4>Top-Down Total Mass</h4><img src='{top_mass_uri}'></div>"
+                     f"<div><h4>Top-Down Surface Temp</h4><img src='{top_temp_uri}'></div>"
                      "</div>")
+            
             h.append("<div class='imgrow'>"
-                     f"<div><h4>Phase Distribution</h4><img src='{_png_data_uri(results_2d['phasebar_paths'][idx])}'></div>"
+                     f"<div><h4>Phase Distribution</h4><img src='{phase_dist_uri}'></div>"
                      "</div>")
+
+            start_m = m.get('start_mass', 0)
+            end_m = m.get('end_mass', 0)
+            ext_m = m.get('extracted_kg', 0)
+            ext_t = m.get('extracted_temp', 0)
+            eff = m.get('drain_efficiency', 0)
+            util = m.get('drain_util', 0)
+            fill_m = m.get('fill_mass', 0)
+            fill_u = m.get('fill_util', 0)
+
             h.append("<table>")
-            h.append(f"<tr><td>Fluid in tank (start of heating)</td><td>{m['start_mass']:.1f} kg</td></tr>")
-            h.append(f"<tr><td>Fluid in tank (end of heating)</td><td>{m['remaining_mass']:.1f} kg</td></tr>")
-            h.append(f"<tr><td>Fluid extracted via drain</td><td>{m['extracted_kg']:.1f} kg</td></tr>")
+            h.append(f"<tr><td>Fluid in tank (start of heating)</td><td>{start_m:.1f} kg</td></tr>")
+            h.append(f"<tr><td>Fluid in tank (end of heating)</td><td>{end_m:.1f} kg</td></tr>")
+            h.append(f"<tr><td>Fluid extracted via drain</td><td>{ext_m:.1f} kg</td></tr>")
+            h.append(f"<tr><td>Average extracted temperature</td><td>{ext_t:.1f} °C</td></tr>" if ext_t > 0 else "<tr><td>Average extracted temperature</td><td>—</td></tr>")
+            h.append(f"<tr><td>Drain efficiency</td><td>{eff:.1f} %</td></tr>")
+            h.append(f"<tr><td>Drain utilisation</td><td>{util:.1f} %</td></tr>")
+            h.append(f"<tr><td>Fluid added via fill</td><td>{fill_m:.1f} kg</td></tr>")
+            h.append(f"<tr><td>Fill utilisation</td><td>{fill_u:.1f} %</td></tr>")
             h.append("</table>")
 
     h.append("</body></html>")
