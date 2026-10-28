@@ -75,17 +75,10 @@ def _html_table(rows):
     for k, v in rows: out.append(f"<tr><td>{k}</td><td>{v}</td></tr>")
     out.append("</table>"); return "\n".join(out)
 
-def _html_prop_arrays(name, T_arr, props):
-    h = [f"<h3>{name} — properties at [{', '.join(f'{t:.1f}' for t in T_arr)}] degC</h3>", "<table><tr><th>Property</th>" + "".join(f"<th>{t:.1f} °C</th>" for t in T_arr) + "</tr>"]
-    for label, vals, unit in props:
-        cells = "".join(f"<td>{v:g} {unit}</td>" for v in vals)
-        h.append(f"<tr><td>{label}</td>{cells}</tr>")
-    h.append("</table>"); return "\n".join(h)
-
 def _png_data_uri(path):
-    if not path or not os.path.exists(path): 
+    if not path or not os.path.exists(path):
         return ""
-    with open(path, "rb") as f: 
+    with open(path, "rb") as f:
         return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
 
 def _T_band(r, cfg, mat, R_ag):
@@ -93,7 +86,7 @@ def _T_band(r, cfg, mat, R_ag):
 
 def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, hot_rows, presets, results_2d=None):
     mat = cfg["_mat"]; cp = coil_properties(cfg, R_ag, n_ag); U_ref = wall_U_at_T(cfg, cfg["T_water_in"])
-    
+
     h = ["<!doctype html><html><head><meta charset='utf-8'><title>Tank Report</title>",
          "<style>body{font-family:sans-serif;max-width:1150px;margin:20px auto;color:#222}",
          "h1{border-bottom:2px solid #333;padding-bottom:6px} h2{margin-top:32px;color:#1a4d7a;border-bottom:1px solid #ddd;padding-bottom:4px}",
@@ -108,9 +101,9 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
          f"<div class='banner'><b>Materials:</b> Coil Fluid={cfg['fluid_name']} | Tank Fluid={cfg['tank_name']} | Tube={cfg['coil_mat']} | Wall={cfg['wall_name']}</div>"]
 
     h.append("<h2>1. Input Parameters</h2>")
-    h.append(f"<h3>Coil Fluid: {cfg['fluid_name']}</h3>" + _html_prop_arrays("Coil", cfg["T_water_arr"], [("Density", cfg["rho_water_arr"], "kg/m³"), ("Cp", cfg["cp_water_arr"], "J/kgK"), ("Mu", cfg["mu_water_arr"], "Pa·s"), ("k", cfg["k_water_arr"], "W/mK")]))
-    h.append(f"<h3>Tank Fluid: {cfg['tank_name']}</h3>" + _html_prop_arrays("Solid", cfg["T_solid_arr"], [("Density", cfg["rho_solid_arr"], "kg/m³"), ("Cp", cfg["cp_solid_arr"], "J/kgK"), ("k", cfg["k_solid_arr"], "W/mK"), ("Mu", cfg["mu_solid_arr"], "Pa·s")]))
-    h.append(_html_prop_arrays("Liquid", cfg["T_liquid_arr"], [("Density", cfg["rho_liquid_arr"], "kg/m³"), ("Cp", cfg["cp_liquid_arr"], "J/kgK"), ("k", cfg["k_liquid_arr"], "W/mK"), ("Mu", cfg["mu_liquid_arr"], "Pa·s")]))
+    # NOTE: Material property tables (Density / Cp / Mu / k vs. temperature) are intentionally
+    # omitted from the report. They were bloating index.html with hundreds of columns and are
+    # not useful to the reader — the material names are already shown in the banner above.
 
     h.append("<h3>Geometry & Operating</h3>" + _html_table([
         ("Inner radius", f"{cfg['r_inner']:.4f} m"), ("Fluid mass (requested)", f"{cfg['M_fluid']:.0f} kg"),
@@ -129,20 +122,21 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
     ]))
 
     if results_2d is not None:
+        # ---------- Section 3: Simulation Results ----------
         h.append("<h2>3. Simulation Results</h2>")
         h.append(f"<p><b>Total Simulation Time:</b> {results_2d.get('total_hr', 0):.1f} h</p>")
-        
+
         h.append("<h3>Extraction Curve</h3>")
         curve_uri = _png_data_uri(results_2d.get('curve_path'))
         if curve_uri: h.append(f"<img src='{curve_uri}' alt='curve'>")
-        
+
         # SAFE GET for missing keys
         fd_val = results_2d.get('first_drain', -1)
         ld_val = results_2d.get('last_drain', -1)
-        
+
         first_t = f"{fd_val:.2f} h" if fd_val >= 0 else "Never"
         last_t = "Never" if ld_val < 0 else f"{ld_val:.2f} h"
-        
+
         h.append("<table>")
         h.append(f"<tr><td>First drain activated</td><td>{first_t}</td></tr>")
         h.append(f"<tr><td>Drain stopped completely</td><td>{last_t}</td></tr>")
@@ -150,10 +144,11 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
         h.append(f"<tr><td>Total Remaining</td><td>{results_2d.get('final_mass', 0):.1f} kg</td></tr>")
         h.append("</table>")
 
+        # ---------- Panel 1: Cycle Details ----------
         h.append("<h2>Panel 1 — Cycle Details</h2>")
         for idx, m in enumerate(results_2d.get("cycle_metrics", [])):
             h.append(f"<h3>Cycle {m['cycle']}</h3>")
-            
+
             lat_temp_uri = _png_data_uri(results_2d['heatmap_paths'][idx]) if idx < len(results_2d.get('heatmap_paths', [])) else ""
             lat_mass_uri = _png_data_uri(results_2d['massmap_paths'][idx]) if idx < len(results_2d.get('massmap_paths', [])) else ""
             top_mass_uri = _png_data_uri(results_2d['topmass_paths'][idx]) if idx < len(results_2d.get('topmass_paths', [])) else ""
@@ -164,12 +159,12 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
                      f"<div><h4>Lateral Temperature</h4><img src='{lat_temp_uri}'></div>"
                      f"<div><h4>Lateral Mass Distribution</h4><img src='{lat_mass_uri}'></div>"
                      "</div>")
-            
+
             h.append("<div class='imgrow'>"
                      f"<div><h4>Top-Down Total Mass</h4><img src='{top_mass_uri}'></div>"
                      f"<div><h4>Top-Down Surface Temp</h4><img src='{top_temp_uri}'></div>"
                      "</div>")
-            
+
             h.append("<div class='imgrow'>"
                      f"<div><h4>Phase Distribution</h4><img src='{phase_dist_uri}'></div>"
                      "</div>")
@@ -193,6 +188,36 @@ def write_report_html(outdir, cfg, R_ag, n_ag, cold_at_selected, cool_reports, h
             h.append(f"<tr><td>Fluid added via fill</td><td>{fill_m:.1f} kg</td></tr>")
             h.append(f"<tr><td>Fill utilisation</td><td>{fill_u:.1f} %</td></tr>")
             h.append("</table>")
+
+        # ---------- Panel 2: Final Summary ----------
+        h.append("<h2>Panel 2 — Final Summary</h2>")
+
+        # Drain Summary table — mirrors the GUI's "Drain Summary" tab.
+        ds = results_2d.get("drain_summary")
+        if ds:
+            fd2 = ds.get('first_drain', -1); ld2 = ds.get('last_drain', -1)
+            first_t2 = f"{fd2:.2f} h" if fd2 >= 0 else "Never"
+            last_t2  = f"{ld2:.2f} h" if ld2 >= 0 else "Never"
+            h.append("<h3>Drain Summary</h3>")
+            h.append("<table>")
+            h.append(f"<tr><td>First drain activated</td><td>{first_t2}</td></tr>")
+            h.append(f"<tr><td>Drain stopped completely</td><td>{last_t2}</td></tr>")
+            h.append(f"<tr><td>Total Drained</td><td>{ds.get('total_drained', 0):.1f} kg</td></tr>")
+            h.append(f"<tr><td>Total Filled</td><td>{ds.get('total_filled', 0):.1f} kg</td></tr>")
+            h.append(f"<tr><td>Total Remaining</td><td>{ds.get('total_remaining', 0):.1f} kg</td></tr>")
+            h.append("</table>")
+
+        # Mass Flow Curve (Drain & Fill) — corresponds to final_mass_flow.png
+        mass_flow_uri = _png_data_uri(results_2d.get("final_mass_flow_path"))
+        if mass_flow_uri:
+            h.append("<h3>Mass Flow Curve (Drain &amp; Fill)</h3>")
+            h.append(f"<img src='{mass_flow_uri}' alt='mass flow curve'>")
+
+        # Timeline — corresponds to final_timeline.png
+        timeline_uri = _png_data_uri(results_2d.get("final_timeline_path"))
+        if timeline_uri:
+            h.append("<h3>Timeline</h3>")
+            h.append(f"<img src='{timeline_uri}' alt='timeline'>")
 
     h.append("</body></html>")
     path = os.path.join(outdir, "index.html")
