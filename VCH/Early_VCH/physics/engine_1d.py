@@ -1,88 +1,19 @@
-# ============================================================
-# engine_1d.py — 1D Radial Physics Engine (Updated Radius Limits)
-# ============================================================
+# physics/engine_1d.py
 import numpy as np
 from numba import njit
-
-@njit(cache=True)
-def h_internal(m_dot, d_in, d_coil_actual, rho, cp, mu, k):
-    A = np.pi * (d_in/2.0)**2
-    v = m_dot / (max(1e-6, rho) * A)
-    Re = rho * v * d_in / max(1e-6, mu)
-    Pr = mu * cp / max(1e-6, k)
-    if Re > 10000.0:
-        f = (0.79*np.log(Re) - 1.64)**-2
-        Nu = (f/8.0)*(Re - 1000.0)*Pr/(1.0 + 2.17*np.sqrt(f/8.0)*(Pr**(2.0/3.0) - 1.0))
-        Nu *= (1.0 + (d_in / d_coil_actual)**0.9)
-    else:
-        Nu = 4.36
-    return Nu * k / d_in
-
-@njit(cache=True)
-def h_external(T_oil, T_grid, rho_grid, cp_grid, k_grid, mu_grid, T_ms,
-               has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out):
-    if T_oil < T_ms and has_agitator == 0:
-        return 5.0
-    rho = np.interp(T_oil, T_grid, rho_grid)
-    cp  = np.interp(T_oil, T_grid, cp_grid)
-    k   = np.interp(T_oil, T_grid, k_grid)
-    mu  = np.interp(T_oil, T_grid, mu_grid)
-    
-    if has_agitator == 1:
-        N_rps = N_rpm / 60.0
-        Re_ia = rho * N_rps * (D_imp**2) / max(1e-6, mu)
-        Pr = mu * cp / max(1e-6, k)
-        if ag_type == 1: C, a = 0.60, 0.67
-        elif ag_type == 2: C, a = 0.54, 0.67
-        elif ag_type == 3: C, a = 0.40, 0.50
-        else: C, a = 0.35, 0.50
-        Nu = C * (Re_ia ** a) * (Pr ** (1.0/3.0)) * visc_corr
-        return Nu * k / d_out
-    else:
-        nu = mu / max(1e-6, rho); alpha = k / max(1e-6, rho * cp); Pr = nu / max(1e-6, alpha)
-        d_char = d_out
-        Ra = 9.81 * beta * dT_natural * (d_char**3) / max(1e-6, nu * alpha)
-        Nu = (0.60 + (0.387 * Ra**(1.0/6.0)) / (1.0 + (0.559/max(1e-6, Pr))**(9.0/16.0))**(8.0/27.0))**2
-        return Nu * k / d_char
-
-@njit(cache=True)
-def calc_Q(m_dot, T_band, T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actual,
-           T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
-           T_tube_arr, k_tube_arr,
-           T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-           has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
-    if T_band >= T_water_in: return 0.0
-    T_eff = 0.5*(T_water_in + T_band)
-    rho_c = np.interp(T_eff, T_water_arr, rho_water_arr)
-    cp_c  = np.interp(T_eff, T_water_arr, cp_water_arr)
-    mu_c  = np.interp(T_eff, T_water_arr, mu_water_arr)
-    k_c   = np.interp(T_eff, T_water_arr, k_water_arr)
-    k_tube = np.interp(T_eff, T_tube_arr, k_tube_arr)
-
-    h_in  = h_internal(m_dot, d_in, d_coil_actual, rho_c, cp_c, mu_c, k_c)
-    h_out = h_external(T_band, T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-                       has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural, d_out)
-                       
-    R_in = 1.0/h_in
-    R_wall = (d_out*np.log(d_out/d_in))/(2.0*k_tube)
-    U = 1.0/(R_in + R_wall + R_f_out + 1.0/h_out)
-    NTU = U*A_coil/(m_dot*cp_c)
-    eps = 1.0 - np.exp(-NTU)
-    return eps * m_dot * cp_c * (T_water_in - T_band)
+from .heat_transfer import is_flowable, h_internal, h_external, calc_Q
 
 @njit(cache=True)
 def transient_kernel(H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
-                     T_ms, T_me,
+                     T_ms, T_me, thresh_liq, thresh_visc,
                      T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid,
                      T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
                      m_dot, T_water_in,
                      d_in, d_out, R_f_out, A_coil, d_coil_actual,
-                     T_tube_arr, k_tube_arr,
-                     M_steel,
+                     T_tube_arr, k_tube_arr, M_steel,
                      T_wall_arr, k_wall_arr, cp_wall_arr,
-                     A_tank_outer, t_wall, t_ins, k_ins, h_air,
-                     T_amb, dt, n_steps,
-                     has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural):
+                     A_tank_outer, t_wall, t_ins, k_ins, h_air, T_amb, dt, n_steps,
+                     beta, dT_natural):
     peak_oil = -1e9; Q_total = 0.0; peak_Q = 0.0
     T = np.empty(N); k_arr = np.empty(N)
 
@@ -96,11 +27,12 @@ def transient_kernel(H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
         step_Q = 0.0
         for i in range(N):
             if inj_w[i] > 0.0:
-                Q_local = calc_Q(m_dot, T[i], T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actual,
+                # H[i] is specific enthalpy (J/kg) in 1D, needed by is_flowable inside calc_Q
+                Q_local = calc_Q(m_dot, T[i], H[i], T_water_in, d_in, d_out, R_f_out, A_coil, d_coil_actual,
                                  T_water_arr, rho_water_arr, cp_water_arr, mu_water_arr, k_water_arr,
                                  T_tube_arr, k_tube_arr,
-                                 T_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms,
-                                 has_agitator, ag_type, N_rpm, D_imp, visc_corr, beta, dT_natural)
+                                 T_grid, H_grid, rho_grid, cp_sens_grid, k_grid, mu_grid, T_ms, T_me, thresh_liq, thresh_visc,
+                                 beta, dT_natural)
                 H[i] += Q_local * inj_w[i] * dt_inv_m[i]
                 Q_total += Q_local * inj_w[i] * dt
                 step_Q += Q_local * inj_w[i]
@@ -294,7 +226,7 @@ def run_one(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr, mode):
 
         H_out, T_steel, peak_oil, Q_total, peak_Q = transient_kernel(
             H, T_steel, N, dr, dt_inv_m, A_face, inj_w,
-            cfg["T_ms"], cfg["T_me"],
+            cfg["T_ms"], cfg["T_me"], cfg["thresh_liq"], cfg["thresh_visc"],
             mat["T_grid"], mat["H_grid"], mat["rho_grid"], mat["cp_sens_grid"], mat["k_grid"], mat["mu_grid"],
             cfg["T_water_arr"], cfg["rho_water_arr"], cfg["cp_water_arr"], cfg["mu_water_arr"], cfg["k_water_arr"],
             m_dot, cfg["T_water_in"],
@@ -303,7 +235,6 @@ def run_one(cfg, mat, R_coil, n_turns, T_amb, T_initial, t_hr, mode):
             cfg["T_wall_arr"], cfg["k_wall_arr"], cfg["cp_wall_arr"],
             A_outer, cfg["t_wall"], cfg["t_ins"], cfg["k_ins"], cfg["h_air"],
             T_amb, dt, n_steps,
-            cfg["has_agitator"], cfg["ag_type"], cfg["N_rpm"], cfg["D_imp"], cfg["visc_corr"],
             cfg["beta_liq"], cfg["dT_natural"])
 
     st = classify(cfg, mat, H_out, m_shell)
